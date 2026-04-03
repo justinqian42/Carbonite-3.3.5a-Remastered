@@ -1,4 +1,4 @@
--- ============================================================================
+﻿-- ============================================================================
 -- CustomWaypoints - Phase 5B (patched UI + safer deep fallback)
 --
 -- PURPOSE
@@ -116,6 +116,126 @@ local ROUTING_TUNING_DEFAULTS = {
 -- parameters.
 local STATE
 local EnsureDb
+
+local function IsAutoDiscoveryEnabled()
+    return STATE.db and STATE.db.transportDiscoveryEnabled == true
+end
+
+local function ClearPendingTransport()
+    STATE.pendingTransport = nil
+    STATE.pendingTransportKey = nil
+end
+
+local function RefreshUiHeader()
+    local db = STATE.db or {}
+    if STATE.ui and STATE.ui.header then
+        STATE.ui.header:SetText("CW options")
+        if STATE.ui.legend then
+            STATE.ui.legend:Hide()
+        end
+        if STATE.ui.checks then
+            if STATE.ui.checks.flying and STATE.ui.checks.flying.SetChecked then STATE.ui.checks.flying:SetChecked(db.hasFlyingMount and true or false) end
+            if STATE.ui.checks.autosync and STATE.ui.checks.autosync.SetChecked then STATE.ui.checks.autosync:SetChecked(db.autoSyncToCarbonite and true or false) end
+            if STATE.ui.checks.autoadvance and STATE.ui.checks.autoadvance.SetChecked then STATE.ui.checks.autoadvance:SetChecked(db.autoAdvance and true or false) end
+            if STATE.ui.checks.flightmasters and STATE.ui.checks.flightmasters.SetChecked then STATE.ui.checks.flightmasters:SetChecked(db.useFlightMasters and true or false) end
+            if STATE.ui.checks.deep and STATE.ui.checks.deep.SetChecked then STATE.ui.checks.deep:SetChecked((not db.simplifyTransitWaypoints) and true or false) end
+            if STATE.ui.checks.debug and STATE.ui.checks.debug.SetChecked then STATE.ui.checks.debug:SetChecked(db.debug and true or false) end
+            if STATE.interfaceChecks.debug and STATE.interfaceChecks.debug.SetChecked then STATE.interfaceChecks.debug:SetChecked(db.debug and true or false) end
+            if STATE.ui.checks.autodiscovery and STATE.ui.checks.autodiscovery.SetChecked then
+                STATE.ui.checks.autodiscovery:SetChecked(IsAutoDiscoveryEnabled())
+            end
+            if STATE.ui.checks.transportconfirmation and STATE.ui.checks.transportconfirmation.SetChecked then STATE.ui.checks.transportconfirmation:SetChecked(db.transportConfirmationEnabled and true or false) end
+        end
+    end
+    if STATE.interfaceChecks then
+        if STATE.interfaceChecks.autosync and STATE.interfaceChecks.autosync.SetChecked then STATE.interfaceChecks.autosync:SetChecked(db.autoSyncToCarbonite and true or false) end
+        if STATE.interfaceChecks.autoadvance and STATE.interfaceChecks.autoadvance.SetChecked then STATE.interfaceChecks.autoadvance:SetChecked(db.autoAdvance and true or false) end
+        if STATE.interfaceChecks.flying and STATE.interfaceChecks.flying.SetChecked then STATE.interfaceChecks.flying:SetChecked(not db.hasFlyingMount and true or false) end
+        if STATE.interfaceChecks.flightmasters and STATE.interfaceChecks.flightmasters.SetChecked then STATE.interfaceChecks.flightmasters:SetChecked(db.useFlightMasters and true or false) end
+        if STATE.interfaceChecks.deep and STATE.interfaceChecks.deep.SetChecked then STATE.interfaceChecks.deep:SetChecked((not db.simplifyTransitWaypoints) and true or false) end
+        if STATE.interfaceChecks.debug and STATE.interfaceChecks.debug.SetChecked then STATE.interfaceChecks.debug:SetChecked(db.debug and true or false) end
+        if STATE.interfaceChecks.portaldiscovery and STATE.interfaceChecks.portaldiscovery.SetChecked then STATE.interfaceChecks.portaldiscovery:SetChecked(db.transportDiscoveryEnabled and true or false) end
+        if STATE.interfaceChecks.transportconfirmation and STATE.interfaceChecks.transportconfirmation.SetChecked then STATE.interfaceChecks.transportconfirmation:SetChecked(db.transportConfirmationEnabled and true or false) end
+        if STATE.interfaceChecks.autorouteinstanceondeath and STATE.interfaceChecks.autorouteinstanceondeath.SetChecked then STATE.interfaceChecks.autorouteinstanceondeath:SetChecked(db.autoRouteSavedInstanceOnDeath and true or false) end
+    end
+end
+
+-- Grow log EditBox with content; optionally scroll frame to bottom and move caret to end (addon log lines).
+local function ResizeLogOutputEditor(scrollToEnd)
+    local ui = STATE.ui
+    if not ui or not ui.output or not ui.scroll then return end
+    local edit, scroll = ui.output, ui.scroll
+    local text = edit:GetText() or ""
+    local _, fh = edit:GetFont()
+    if not fh or fh < 8 then fh = 14 end
+    local _, n = string.gsub(text, "\n", "\n")
+    local lines = n + 1
+    local viewH = scroll:GetHeight() or 200
+    local minH = math.max(viewH, lines * fh + fh * 2)
+    edit:SetHeight(minH)
+    if scroll.UpdateScrollChildRect then
+        pcall(function() scroll:UpdateScrollChildRect() end)
+    end
+    if scrollToEnd and scroll.GetVerticalScrollRange and scroll.SetVerticalScroll then
+        local ok, range = pcall(function() return scroll:GetVerticalScrollRange() end)
+        if ok and type(range) == "number" and range >= 0 then
+            pcall(function() scroll:SetVerticalScroll(range) end)
+        end
+        local len = string.len(text)
+        if edit.SetCursorPosition then
+            pcall(function() edit:SetCursorPosition(len) end)
+        end
+    end
+end
+
+local function AppendUiLogLine(line)
+    if STATE.outputRecursing then return end
+    local log = STATE.uiLog
+    log[#log + 1] = tostring(line)
+    local maxLines = STATE.maxUiLog or 400
+    while #log > maxLines do
+        tremove(log, 1)
+    end
+
+    if STATE.ui and STATE.ui.output then
+        STATE.outputRecursing = true
+        STATE.ui.output:SetText(table.concat(log, "\n"))
+        ResizeLogOutputEditor(true)
+        STATE.outputRecursing = false
+    end
+end
+
+local function pr(msg)
+    local line = "CWPhase5B: " .. tostring(msg)
+    DEFAULT_CHAT_FRAME:AddMessage("|cff80ff80CWPhase5B:|r " .. tostring(msg))
+    AppendUiLogLine(line)
+end
+
+local function SetAutoDiscoveryEnabled(enabled, quiet)
+    EnsureDb()
+    enabled = enabled and true or false
+    STATE.db.transportDiscoveryEnabled = enabled
+
+    if not enabled then
+        STATE.pendingConfirmationTransport = nil
+        STATE.activeConfirmationKey = nil
+        if STATE.confirmationFrame and STATE.confirmationFrame.Hide and STATE.confirmationFrame:IsShown() then
+            STATE.confirmationFrame:Hide()
+        end
+        ClearPendingTransport()
+    end
+
+    RefreshUiHeader()
+
+    if not quiet then
+        pr("autodiscovery=" .. tostring(enabled))
+    end
+end
+
+local function ToggleAutoDiscovery()
+    SetAutoDiscoveryEnabled(not IsAutoDiscoveryEnabled())
+end
+
 local function GetRoutingTuning()
     local out = {}
     local overrides = (STATE.db and STATE.db.routingTuning) or {}
@@ -396,6 +516,71 @@ local function WasConfirmationRecentlyHandled(fromPos, toPos)
     return r.key == BuildTransportConfirmationKey(fromPos, toPos)
 end
 
+
+local CW_ESC_OVERRIDE_BUTTON_NAME = "CustomWaypointsEscOverrideButton"
+
+local EnsureCwEscOverrideButton
+local RefreshCwEscOverride
+local HideTopCwModalFrame
+
+RefreshCwEscOverride = function()
+    local owner = STATE.frame or UIParent
+    local stack = STATE.cwModalStack or {}
+    local hasShown = false
+
+    for i = #stack, 1, -1 do
+        local f = stack[i]
+        if f and f.IsShown and f:IsShown() then
+            hasShown = true
+            break
+        end
+    end
+
+    if ClearOverrideBindings then
+        ClearOverrideBindings(owner)
+    end
+
+    -- During combat, let WoW handle ESC normally (game menu / default close chain).
+    if InCombatLockdown and InCombatLockdown() then
+        return
+    end
+
+    if hasShown and SetOverrideBindingClick then
+        EnsureCwEscOverrideButton()
+        SetOverrideBindingClick(owner, true, "ESCAPE", CW_ESC_OVERRIDE_BUTTON_NAME, "LeftButton")
+    end
+end
+
+HideTopCwModalFrame = function()
+    local stack = STATE.cwModalStack or {}
+    for i = #stack, 1, -1 do
+        local f = stack[i]
+        if f and f.IsShown and f:IsShown() then
+            f:Hide()
+            RefreshCwEscOverride()
+            return true
+        end
+    end
+    RefreshCwEscOverride()
+    return false
+end
+
+EnsureCwEscOverrideButton = function()
+    local btn = _G[CW_ESC_OVERRIDE_BUTTON_NAME]
+    if btn then return btn end
+
+    btn = CreateFrame("Button", CW_ESC_OVERRIDE_BUTTON_NAME, UIParent, "SecureActionButtonTemplate")
+    btn:SetWidth(1)
+    btn:SetHeight(1)
+    btn:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -1000, 1000)
+    btn:Hide()
+    btn:SetScript("OnClick", function()
+        HideTopCwModalFrame()
+    end)
+
+    return btn
+end
+
 local function PushCwModalFrame(frame)
     if not frame then return end
     STATE.cwModalStack = STATE.cwModalStack or {}
@@ -405,6 +590,7 @@ local function PushCwModalFrame(frame)
         end
     end
     STATE.cwModalStack[#STATE.cwModalStack + 1] = frame
+    RefreshCwEscOverride()
 end
 
 local function RemoveCwModalFrame(frame)
@@ -415,26 +601,17 @@ local function RemoveCwModalFrame(frame)
             break
         end
     end
-end
-
-local function HideTopCwModalFrame()
-    local stack = STATE.cwModalStack or {}
-    for i = #stack, 1, -1 do
-        local f = stack[i]
-        if f and f.IsShown and f:IsShown() then
-            f:Hide()
-            return true
-        end
-    end
-    return false
+    RefreshCwEscOverride()
 end
 
 local function ArmKeyboardModalFrame(frame)
     if not frame then return end
     PushCwModalFrame(frame)
+    -- Keep CW windows on the modal stack without forcing frame-level keyboard capture.
+    -- On WoW 3.3.5a, EnableKeyboard(true) on parent frames can steal movement keys
+    -- even when no edit box is focused, so ESC close falls back to UISpecialFrames.
     if frame.EnableKeyboard then
         pcall(function() frame:EnableKeyboard(false) end)
-        pcall(function() frame:EnableKeyboard(true) end)
     end
     if frame.SetPropagateKeyboardInput then
         pcall(function() frame:SetPropagateKeyboardInput(true) end)
@@ -450,90 +627,6 @@ local function BuildLegendText()
     return ""
 end
 
--- Grow log EditBox with content; optionally scroll frame to bottom and move caret to end (addon log lines).
-local function ResizeLogOutputEditor(scrollToEnd)
-    local ui = STATE.ui
-    if not ui or not ui.output or not ui.scroll then return end
-    local edit, scroll = ui.output, ui.scroll
-    local text = edit:GetText() or ""
-    local _, fh = edit:GetFont()
-    if not fh or fh < 8 then fh = 14 end
-    local _, n = string.gsub(text, "\n", "\n")
-    local lines = n + 1
-    local viewH = scroll:GetHeight() or 200
-    local minH = math.max(viewH, lines * fh + fh * 2)
-    edit:SetHeight(minH)
-    if scroll.UpdateScrollChildRect then
-        pcall(function() scroll:UpdateScrollChildRect() end)
-    end
-    if scrollToEnd and scroll.GetVerticalScrollRange and scroll.SetVerticalScroll then
-        local ok, range = pcall(function() return scroll:GetVerticalScrollRange() end)
-        if ok and type(range) == "number" and range >= 0 then
-            pcall(function() scroll:SetVerticalScroll(range) end)
-        end
-        local len = string.len(text)
-        if edit.SetCursorPosition then
-            pcall(function() edit:SetCursorPosition(len) end)
-        end
-    end
-end
-
-local function AppendUiLogLine(line)
-    if STATE.outputRecursing then return end
-    local log = STATE.uiLog
-    log[#log + 1] = tostring(line)
-    local maxLines = STATE.maxUiLog or 400
-    while #log > maxLines do
-        tremove(log, 1)
-    end
-
-    if STATE.ui and STATE.ui.output then
-        STATE.outputRecursing = true
-        STATE.ui.output:SetText(table.concat(log, "\n"))
-        ResizeLogOutputEditor(true)
-        STATE.outputRecursing = false
-    end
-end
-
-local function RefreshUiHeader()
-    local db = STATE.db or {}
-    if STATE.ui and STATE.ui.header then
-        STATE.ui.header:SetText(string.format(
-            "CW options | autosync=%s autoadvance=%s flying=%s deep=%s flightmasters=%s portalDiscovery=%s",
-            tostring(db.autoSyncToCarbonite),
-            tostring(db.autoAdvance),
-            tostring(db.hasFlyingMount),
-            tostring(not db.simplifyTransitWaypoints),
-            tostring(db.useFlightMasters),
-            tostring(db.transportDiscoveryEnabled)
-        ))
-        if STATE.ui.legend then
-            STATE.ui.legend:Hide()
-        end
-        if STATE.ui.checks then
-            if STATE.ui.checks.flying and STATE.ui.checks.flying.SetChecked then STATE.ui.checks.flying:SetChecked(db.hasFlyingMount and true or false) end
-            if STATE.ui.checks.autosync and STATE.ui.checks.autosync.SetChecked then STATE.ui.checks.autosync:SetChecked(db.autoSyncToCarbonite and true or false) end
-            if STATE.ui.checks.autoadvance and STATE.ui.checks.autoadvance.SetChecked then STATE.ui.checks.autoadvance:SetChecked(db.autoAdvance and true or false) end
-            if STATE.ui.checks.flightmasters and STATE.ui.checks.flightmasters.SetChecked then STATE.ui.checks.flightmasters:SetChecked(db.useFlightMasters and true or false) end
-            if STATE.ui.checks.deep and STATE.ui.checks.deep.SetChecked then STATE.ui.checks.deep:SetChecked((not db.simplifyTransitWaypoints) and true or false) end
-            if STATE.ui.checks.debug and STATE.ui.checks.debug.SetChecked then STATE.ui.checks.debug:SetChecked(db.debug and true or false) end
-            if STATE.interfaceChecks.debug and STATE.interfaceChecks.debug.SetChecked then STATE.interfaceChecks.debug:SetChecked(db.debug and true or false) end
-            if STATE.ui.checks.portaldiscovery and STATE.ui.checks.portaldiscovery.SetChecked then STATE.ui.checks.portaldiscovery:SetChecked(db.transportDiscoveryEnabled and true or false) end
-            if STATE.ui.checks.transportconfirmation and STATE.ui.checks.transportconfirmation.SetChecked then STATE.ui.checks.transportconfirmation:SetChecked(db.transportConfirmationEnabled and true or false) end
-        end
-    end
-    if STATE.interfaceChecks then
-        if STATE.interfaceChecks.autosync and STATE.interfaceChecks.autosync.SetChecked then STATE.interfaceChecks.autosync:SetChecked(db.autoSyncToCarbonite and true or false) end
-        if STATE.interfaceChecks.autoadvance and STATE.interfaceChecks.autoadvance.SetChecked then STATE.interfaceChecks.autoadvance:SetChecked(db.autoAdvance and true or false) end
-        if STATE.interfaceChecks.flying and STATE.interfaceChecks.flying.SetChecked then STATE.interfaceChecks.flying:SetChecked(not db.hasFlyingMount and true or false) end
-        if STATE.interfaceChecks.flightmasters and STATE.interfaceChecks.flightmasters.SetChecked then STATE.interfaceChecks.flightmasters:SetChecked(db.useFlightMasters and true or false) end
-        if STATE.interfaceChecks.deep and STATE.interfaceChecks.deep.SetChecked then STATE.interfaceChecks.deep:SetChecked((not db.simplifyTransitWaypoints) and true or false) end
-        if STATE.interfaceChecks.debug and STATE.interfaceChecks.debug.SetChecked then STATE.interfaceChecks.debug:SetChecked(db.debug and true or false) end
-        if STATE.interfaceChecks.portaldiscovery and STATE.interfaceChecks.portaldiscovery.SetChecked then STATE.interfaceChecks.portaldiscovery:SetChecked(db.transportDiscoveryEnabled and true or false) end
-        if STATE.interfaceChecks.transportconfirmation and STATE.interfaceChecks.transportconfirmation.SetChecked then STATE.interfaceChecks.transportconfirmation:SetChecked(db.transportConfirmationEnabled and true or false) end
-        if STATE.interfaceChecks.autorouteinstanceondeath and STATE.interfaceChecks.autorouteinstanceondeath.SetChecked then STATE.interfaceChecks.autorouteinstanceondeath:SetChecked(db.autoRouteSavedInstanceOnDeath and true or false) end
-    end
-end
 local function ApplyRoutingTuningChange(key, value, skipUiRefresh, skipSync)
     EnsureDb()
     if not key then return end
@@ -592,19 +685,6 @@ EnsureRoutingTuningUi = function()
         return STATE.tuningUi
     end
 
-    local f = CreateFrame('Frame', 'CustomWaypointsRoutingTuningFrame', UIParent)
-    f:SetWidth(520)
-    f:SetHeight(430)
-    f:SetPoint('CENTER', UIParent, 'CENTER', 40, -20)
-    -- Keep tuning above CW main UI to prevent visual mixing.
-    f:SetFrameStrata('TOOLTIP')
-    f:SetScale((STATE.db and STATE.db.uiScale) or 1)
-    f:SetClampedToScreen(true)
-    f:EnableMouse(true)
-    f:SetMovable(true)
-    f:RegisterForDrag('LeftButton')
-    f:SetScript('OnDragStart', function(self) self:StartMoving() end)
-    f:SetScript('OnDragStop', function(self) self:StopMovingOrSizing() end)
     local pendingValues = {}
     local function FlushPendingRoutingTuningChanges()
         if not STATE.tuningUi or STATE.tuningUi.applyingPending then return end
@@ -633,21 +713,46 @@ EnsureRoutingTuningUi = function()
         STATE.tuningUi.applyingPending = false
     end
 
+    local f = CreateFrame('Frame', 'CustomWaypointsRoutingTuningFrame', UIParent)
+    f:SetWidth(520)
+    f:SetHeight(430)
+    f:SetPoint('CENTER', UIParent, 'CENTER', 40, -20)
+    -- Keep tuning above CW main UI to prevent visual mixing.
+    f:SetFrameStrata('TOOLTIP')
+    f:SetScale((STATE.db and STATE.db.uiScale) or 1)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag('LeftButton')
+    f:SetScript('OnDragStart', function(self) self:StartMoving() end)
+    f:SetScript('OnDragStop', function(self) self:StopMovingOrSizing() end)
     f:SetScript('OnShow', function(self)
         if STATE.ui and STATE.ui.frame and self.SetFrameLevel then
             local baseLevel = (STATE.ui.frame.GetFrameLevel and STATE.ui.frame:GetFrameLevel()) or 1
             self:SetFrameLevel(baseLevel + 30)
         end
+        if self.EnableKeyboard then
+            pcall(function() self:EnableKeyboard(false) end)
+        end
+        if self.SetPropagateKeyboardInput then
+            pcall(function() self:SetPropagateKeyboardInput(true) end)
+        end
         RefreshRoutingTuningUi()
     end)
     f:SetScript('OnHide', function(self)
+        RemoveCwModalFrame(self)
+        if self.SetPropagateKeyboardInput then
+            pcall(function() self:SetPropagateKeyboardInput(true) end)
+        end
+        if self.EnableKeyboard then
+            pcall(function() self:EnableKeyboard(false) end)
+        end
         -- Delay heavy route recalculation until slider release or tuning close.
         FlushPendingRoutingTuningChanges()
     end)
-    if UISpecialFrames and not STATE.tuningUiSpecialRegistered then
-        tinsert(UISpecialFrames, 'CustomWaypointsRoutingTuningFrame')
-        STATE.tuningUiSpecialRegistered = true
-    end
+    f:SetScript('OnMouseDown', function(self)
+        PushCwModalFrame(self)
+    end)
 
     local bg = f:CreateTexture(nil, 'BACKGROUND')
     bg:SetAllPoints(f)
@@ -683,7 +788,6 @@ EnsureRoutingTuningUi = function()
         { key = 'boatBonus', label = 'Boat preference', min = 0, max = 300, step = 5 },
         { key = 'zeppelinBonus', label = 'Zeppelin preference', min = 0, max = 300, step = 5 },
         { key = 'taxiBonus', label = 'Flight master preference', min = 0, max = 300, step = 5 },
-
         { key = 'maxPostPortalWalkWithoutTaxi', label = 'Max post-portal walk w/o taxi (yards)', min = 0, max = 700, step = 5 },
     }
 
@@ -1281,12 +1385,6 @@ local function SaveInstanceKnownLocation(fromPos, toPos)
     }
 end
 
-local function pr(msg)
-    local line = "CWPhase5B: " .. tostring(msg)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff80ff80CWPhase5B:|r " .. tostring(msg))
-    AppendUiLogLine(line)
-end
-
 local function dbg(msg)
     if STATE.db and STATE.db.debug == true then
         pr(msg)
@@ -1674,7 +1772,7 @@ local function ShowKnownRouteEditorPopup(sourceIndex, loc)
     f:EnableMouse(true)
     f:SetMovable(true)
     f:RegisterForDrag("LeftButton")
-    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
     f:SetScript("OnDragStart", function(self) self:StartMoving() end)
     f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
     f:SetScript("OnKeyDown", function(self, key)
@@ -1950,7 +2048,7 @@ ShowKnownLocationImportPopup = function()
     f:EnableMouse(true)
     f:SetMovable(true)
     f:RegisterForDrag("LeftButton")
-    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
     f:SetScript("OnDragStart", function(self) self:StartMoving() end)
     f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
     f:SetScript("OnKeyDown", function(self, key)
@@ -2210,6 +2308,7 @@ ShowKnownLocationsFrame = function()
         if f:IsShown() then
             f:Hide()
         else
+            ArmKeyboardModalFrame(f)
             RefreshKnownLocationsFrame()
             f:Show()
         end
@@ -2226,23 +2325,25 @@ ShowKnownLocationsFrame = function()
     f:EnableMouse(true)
     f:SetMovable(true)
     f:RegisterForDrag("LeftButton")
-    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
     if f.SetPropagateKeyboardInput then f:SetPropagateKeyboardInput(true) end
     f:SetScript("OnDragStart", function(self) self:StartMoving() end)
     f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
-    f:SetScript("OnKeyDown", function(self, key)
+    f:SetScript("OnShow", function(self)
+        PushCwModalFrame(self)
+    end)
+    f:SetScript("OnHide", function(self)
+        RemoveCwModalFrame(self)
         if self.SetPropagateKeyboardInput then
-            self:SetPropagateKeyboardInput(key == "ESCAPE" and false or true)
+            self:SetPropagateKeyboardInput(true)
         end
-        if key == "ESCAPE" then
-            self:Hide()
+        if self.EnableKeyboard then
+            self:EnableKeyboard(false)
         end
     end)
-
-    if UISpecialFrames and not STATE.knownLocationsSpecialRegistered then
-        tinsert(UISpecialFrames, "CustomWaypointsKnownLocationsFrame")
-        STATE.knownLocationsSpecialRegistered = true
-    end
+    f:SetScript("OnMouseDown", function(self)
+        PushCwModalFrame(self)
+    end)
 
     local bg = f:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints(f)
@@ -2401,6 +2502,7 @@ ShowKnownLocationsFrame = function()
     }
 
     RefreshKnownLocationsFrame()
+    ArmKeyboardModalFrame(f)
     f:Show()
 end
 
@@ -2615,7 +2717,7 @@ local function ShowTransportManagementFrame()
         cf:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
 
         -- ESC closes only. No keyboard confirm.
-        if cf.EnableKeyboard then cf:EnableKeyboard(true) end
+        if cf.EnableKeyboard then cf:EnableKeyboard(false) end
         cf:SetScript("OnKeyDown", function(self, key)
             if key == "ESCAPE" then
                 self:Hide()
@@ -2672,9 +2774,22 @@ local function ShowTransportManagementFrame()
             self:SetParent(nil)
         end)
 
-        if UISpecialFrames then
-            tinsert(UISpecialFrames, "CustomWaypointsTransportManagement")
-        end
+        cf:SetScript("OnShow", function(self)
+            PushCwModalFrame(self)
+            if self.EnableKeyboard then self:EnableKeyboard(false) end
+            if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
+        end)
+
+        cf:SetScript("OnHide", function(self)
+            RemoveCwModalFrame(self)
+            if self.EnableKeyboard then self:EnableKeyboard(false) end
+            if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
+            self:SetParent(nil)
+        end)
+
+        cf:SetScript("OnMouseDown", function(self)
+            PushCwModalFrame(self)
+        end)
 
         cf:Show()
     end
@@ -2717,14 +2832,9 @@ local function ShowTransportManagementFrame()
         f:Hide()
     end)
 
-    if UISpecialFrames and not STATE.transportManagementSpecialRegistered then
-        tinsert(UISpecialFrames, "CustomWaypointsTransportManagement")
-        STATE.transportManagementSpecialRegistered = true
-    end
-
     f:SetScript("OnShow", function(self)
         PushCwModalFrame(self)
-        if self.EnableKeyboard then self:EnableKeyboard(true) end
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
         if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
     end)
 
@@ -2732,6 +2842,9 @@ local function ShowTransportManagementFrame()
         RemoveCwModalFrame(self)
         if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
         if self.EnableKeyboard then self:EnableKeyboard(false) end
+    end)
+    f:SetScript("OnMouseDown", function(self)
+        PushCwModalFrame(self)
     end)
 
     STATE.transportManagementFrame = f
@@ -2973,13 +3086,14 @@ local function EnsureUi()
     end)
     checks.debug = MakeCheckbox("Debug", 500, -122, function() SlashHandler("debug") end)
     
-    checks.portaldiscovery = MakeCheckbox("PortalDiscovery", 600, -122, function() SlashHandler("transportdiscovery") end)
+    checks.autodiscovery = MakeCheckbox("AutoDiscovery", 600, -122, function() SlashHandler("autodiscovery") end)
+    checks.portaldiscovery = checks.autodiscovery
 
     local commands = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     commands:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -142)
     commands:SetWidth(720)
     commands:SetJustifyH("LEFT")
-    commands:SetText("\n/cw help | ui | tuning | options | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | transportdiscovery | transportconfirmation | managetransports | knownlocations | routeknown <index> | saveroute | savehere")
+    commands:SetText("\n/cw help | ui | tuning | options | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | autodiscovery | transportconfirmation | managetransports | knownlocations | routeknown <index> | saveroute | savehere")
 
     local importLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     importLabel:SetPoint("TOPLEFT", commands, "BOTTOMLEFT", 0, -6)
@@ -2992,7 +3106,7 @@ local function EnsureUi()
     importBox:SetFontObject(GameFontHighlightSmall)
     importBox:SetAutoFocus(false)
     importBox:EnableMouse(true)
-    if importBox.EnableKeyboard then importBox:EnableKeyboard(true) end
+    -- if importBox.EnableKeyboard then importBox:EnableKeyboard(true) end
     importBox:SetTextInsets(4, 4, 4, 4)
     importBox:SetJustifyH("LEFT")
     if importBox.SetMaxLetters then importBox:SetMaxLetters(16384) end
@@ -3011,7 +3125,7 @@ local function EnsureUi()
     output:SetAutoFocus(false)
     output:EnableMouse(true)
     -- Allow typing notes, selection, Ctrl+C copy when focused (chat log still refreshed by addon).
-    if output.EnableKeyboard then output:EnableKeyboard(true) end
+    -- if output.EnableKeyboard then output:EnableKeyboard(true) end
     output:SetFontObject(ChatFontNormal)
     output:SetWidth(690)
     output:SetHeight(200)
@@ -3062,13 +3176,13 @@ local function EnsureInterfaceOptionsPanel()
     title:SetPoint("TOPLEFT", 16, -16)
     title:SetText("CustomWaypoints")
 
-    local subtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
-    subtitle:SetWidth(500)
-    subtitle:SetJustifyH("LEFT")
-    subtitle:SetJustifyV("TOP")
-    if subtitle.SetNonSpaceWrap then subtitle:SetNonSpaceWrap(true) end
-    subtitle:SetText("Deep routing + flight masters (defaults). Undo/redo = step through queue history\n (add/clear/pop). /cw undo | redo; Ctrl+Shift+Z | Y if free.")
+    -- local subtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    -- subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
+    -- subtitle:SetWidth(500)
+    -- subtitle:SetJustifyH("LEFT")
+    -- subtitle:SetJustifyV("TOP")
+    -- if subtitle.SetNonSpaceWrap then subtitle:SetNonSpaceWrap(true) end
+    -- subtitle:SetText("Deep routing + flight masters (defaults). Undo/redo = step through queue history\n (add/clear/pop). /cw undo | redo; Ctrl+Shift+Z | Y if free.")
 
     local function MakePanelCheckbox(textLabel, x, y, onClick)
         local cb = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
@@ -3652,11 +3766,6 @@ local function GetDisplayedCapture(map)
     }
 end
 
-local function ClearPendingTransport()
-    STATE.pendingTransport = nil
-    STATE.pendingTransportKey = nil
-end
-
 local function BeginPendingTransport(reason, fromPos)
     if not fromPos or not fromPos.maI then return end
 
@@ -3738,7 +3847,7 @@ local function ShowTransportConfirmationFrame()
     f:EnableMouse(true)
     f:SetMovable(true)
     f:RegisterForDrag("LeftButton")
-    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
     f:SetScript("OnKeyDown", function(self, key)
         if key == "ESCAPE" then
             local p2 = STATE.pendingConfirmationTransport
@@ -3792,14 +3901,11 @@ local function ShowTransportConfirmationFrame()
 
     local label = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     label:SetPoint("LEFT", disableDiscovery, "RIGHT", 2, 1)
-    label:SetText("Don't ask again (disable Portal Discovery)")
+    label:SetText("Don't ask again (disable AutoDiscovery)")
 
     local function ApplyPopupToggle()
         if disableDiscovery:GetChecked() then
-            EnsureDb()
-            STATE.db.transportDiscoveryEnabled = false
-            RefreshUiHeader()
-            pr("transportDiscoveryEnabled=false")
+            SetAutoDiscoveryEnabled(false)
         end
     end
 
@@ -3889,7 +3995,7 @@ local function ShowTransportConfirmationFrame()
 
     f:SetScript("OnShow", function(self)
         PushCwModalFrame(self)
-        if self.EnableKeyboard then self:EnableKeyboard(true) end
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
     end)
 
     local oldOnHide = f:GetScript("OnHide")
@@ -3913,6 +4019,11 @@ end
 local function RequestLearnedTransportConfirmation(fromPos, toPos, reason)
     if not fromPos or not toPos then return end
     EnsureDb()
+
+    if not IsAutoDiscoveryEnabled() then
+        dbg("autodiscovery disabled: skipped transport discovery")
+        return
+    end
 
     if IsConfirmationDismissed(fromPos, toPos) then
         dbg("confirmation suppressed for recently dismissed transport/instance")
@@ -4028,7 +4139,8 @@ local function ClearLearnedTransports()
 end
 
 local function PulseTransportDiscovery(elapsed)
-    if not (STATE.db and STATE.db.transportDiscoveryEnabled) then return end
+    if not IsAutoDiscoveryEnabled() then return end
+    
     local now = GetTime and GetTime() or 0
     if now < (STATE.lastTransportScan or 0) then
         STATE.lastTransportScan = 0
@@ -5994,7 +6106,7 @@ ShowWaypointMetadataPopup = function(opts)
     f:EnableMouse(true)
     f:SetMovable(true)
     f:RegisterForDrag("LeftButton")
-    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
     f:SetScript("OnDragStart", function(self) self:StartMoving() end)
     f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
     f:SetScript("OnKeyDown", function(self, key)
@@ -6342,7 +6454,7 @@ SlashHandler = function(msg)
     msg = string.lower((msg or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 
     if msg == "" or msg == "help" then
-        pr("commands: /cw ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | transportdiscovery | transportconfirmation | managetransports")
+        pr("commands: /cw ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | autodiscovery | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | transportconfirmation | managetransports")
         return
     elseif msg == "ui" or msg == "panel" or msg == "window" then
         EnsureUi()
@@ -6467,9 +6579,8 @@ SlashHandler = function(msg)
     elseif msg == "transportlog" then
         STATE.db.transportLogEnabled = not STATE.db.transportLogEnabled
         pr("transportLogEnabled=" .. tostring(STATE.db.transportLogEnabled))
-    elseif msg == "transportdiscovery" then
-        STATE.db.transportDiscoveryEnabled = not STATE.db.transportDiscoveryEnabled
-        pr("transportDiscoveryEnabled=" .. tostring(STATE.db.transportDiscoveryEnabled))
+    elseif msg == "autodiscovery" or msg == "transportdiscovery" or msg == "portaldiscovery" then
+        ToggleAutoDiscovery()
     elseif msg == "transportconfirmation" then
         STATE.db.transportConfirmationEnabled = not STATE.db.transportConfirmationEnabled
         pr("transportConfirmationEnabled=" .. tostring(STATE.db.transportConfirmationEnabled))
@@ -6544,6 +6655,8 @@ local function OnEvent(_, event)
     elseif event == "PLAYER_ALIVE" or event == "PLAYER_UNGHOST" then
         EnsureDb()
         StartPendingDeathAutoRoute(0.35)
+    elseif event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED" then
+        RefreshCwEscOverride()
     end
 end
 
@@ -6585,6 +6698,8 @@ frame:RegisterEvent("ZONE_CHANGED_INDOORS")
 frame:RegisterEvent("PLAYER_DEAD")
 frame:RegisterEvent("PLAYER_ALIVE")
 frame:RegisterEvent("PLAYER_UNGHOST")
+frame:RegisterEvent("PLAYER_REGEN_DISABLED")
+frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:SetScript("OnEvent", OnEvent)
 frame:SetScript("OnUpdate", OnUpdate)
 
@@ -6600,229 +6715,3 @@ CW.ImportWaypointsFromText = ImportWaypointsFromText
 
 CW.EnsureUi = EnsureUi
 CW.ToggleUi = ToggleUi
-
-
-
-
-
-
-
-
-
-
--- ============================================================================
--- CW modal stack unification patch (append-only)
--- PURPOSE:
---   ESC closes only the most recent CustomWaypoints frame (opened or interacted)
---   instead of relying on default UISpecialFrames chain behavior.
--- ============================================================================
-do
-    local CW_MODAL_FRAME_NAMES = {
-        "CustomWaypointsTransportConfirmationFrame",
-        "CustomWaypointsWaypointMetadataPopup",
-        "CustomWaypointsKnownLocationsImportPopup",
-        "CustomWaypointsKnownRouteEditorPopup",
-        "CustomWaypointsRoutingTuningFrame",
-        "CustomWaypointsTransportManagement",
-    }
-
-    local function CwRemoveFromSpecialFrames(frameName)
-        if not frameName or not UISpecialFrames then return end
-        for i = #UISpecialFrames, 1, -1 do
-            if UISpecialFrames[i] == frameName then
-                table.remove(UISpecialFrames, i)
-            end
-        end
-    end
-
-    local function CwWrapScript(frame, scriptName, wrapperFactory)
-        if not frame or not scriptName or not wrapperFactory then return end
-        local old = frame:GetScript(scriptName)
-        frame:SetScript(scriptName, wrapperFactory(old))
-    end
-
-    local function CwEnsureModalFrame(frame, frameName)
-        if not frame or frame.__cwModalUnified then return end
-        frame.__cwModalUnified = true
-        frame.__cwModalName = frameName or (frame.GetName and frame:GetName()) or nil
-
-        if frame.__cwModalName then
-            CwRemoveFromSpecialFrames(frame.__cwModalName)
-        end
-
-
-
-        CwWrapScript(frame, "OnShow", function(old)
-            return function(self, ...)
-                PushCwModalFrame(self)
-                if self.EnableKeyboard and self.IsShown and self:IsShown() then
-                    pcall(function() self:EnableKeyboard(true) end)
-                end
-                if self.SetPropagateKeyboardInput then
-                    pcall(function() self:SetPropagateKeyboardInput(true) end)
-                end
-                if old then return old(self, ...) end
-            end
-        end)
-
-        CwWrapScript(frame, "OnHide", function(old)
-            return function(self, ...)
-                RemoveCwModalFrame(self)
-                if self.SetPropagateKeyboardInput then
-                    pcall(function() self:SetPropagateKeyboardInput(true) end)
-                end
-                if self.EnableKeyboard then
-                    pcall(function() self:EnableKeyboard(false) end)
-                end
-                if old then return old(self, ...) end
-            end
-        end)
-
-        CwWrapScript(frame, "OnMouseDown", function(old)
-            return function(self, ...)
-                PushCwModalFrame(self)
-                if old then return old(self, ...) end
-            end
-        end)
-
-        CwWrapScript(frame, "OnMouseUp", function(old)
-            return function(self, ...)
-                PushCwModalFrame(self)
-                if old then return old(self, ...) end
-            end
-        end)
-
-        CwWrapScript(frame, "OnKeyDown", function(old)
-            return function(self, key, ...)
-                PushCwModalFrame(self)
-                if self.SetPropagateKeyboardInput then
-                    pcall(function() self:SetPropagateKeyboardInput(key == "ESCAPE" and false or true) end)
-                end
-                if key == "ESCAPE" then
-                    local wasShown = self.IsShown and self:IsShown()
-                    if old then
-                        local result = old(self, key, ...)
-                        if not (self.IsShown and self:IsShown()) then
-                            return result
-                        end
-                    end
-                    if wasShown and self.IsShown and self:IsShown() then
-                        if HideTopCwModalFrame() then return end
-                    end
-                    return
-                end
-                if old then return old(self, key, ...) end
-            end
-        end)
-    end
-
-    local function CwEnsureModalEditBox(editBox, ownerFrame)
-        if not editBox or editBox.__cwModalUnified then return end
-        editBox.__cwModalUnified = true
-
-        local oldFocus = editBox:GetScript("OnEditFocusGained")
-        editBox:SetScript("OnEditFocusGained", function(self, ...)
-            if ownerFrame then PushCwModalFrame(ownerFrame) end
-            if oldFocus then return oldFocus(self, ...) end
-        end)
-
-        local oldMouseDown = editBox:GetScript("OnMouseDown")
-        editBox:SetScript("OnMouseDown", function(self, ...)
-            if ownerFrame then PushCwModalFrame(ownerFrame) end
-            if oldMouseDown then return oldMouseDown(self, ...) end
-        end)
-
-        local oldEscape = editBox:GetScript("OnEscapePressed")
-        editBox:SetScript("OnEscapePressed", function(self, ...)
-            if self.ClearFocus then self:ClearFocus() end
-            if ownerFrame then
-                PushCwModalFrame(ownerFrame)
-                local onKeyDown = ownerFrame.GetScript and ownerFrame:GetScript("OnKeyDown")
-                if onKeyDown then
-                    return onKeyDown(ownerFrame, "ESCAPE")
-                end
-            end
-            if HideTopCwModalFrame() then return end
-            if oldEscape then return oldEscape(self, ...) end
-        end)
-    end
-
-    local function CwTryHookStateFrames()
-        if not STATE then return end
-
-        if STATE.ui and STATE.ui.frame then
-            CwEnsureModalFrame(STATE.ui.frame, (STATE.ui.frame.GetName and STATE.ui.frame:GetName()) or "STATE.ui.frame")
-        end
-
-        if STATE.knownLocationsUi and STATE.knownLocationsUi.frame then
-            CwEnsureModalFrame(STATE.knownLocationsUi.frame, (STATE.knownLocationsUi.frame.GetName and STATE.knownLocationsUi.frame:GetName()) or "STATE.knownLocationsUi.frame")
-        end
-
-        if STATE.transportManagementFrame then
-            CwEnsureModalFrame(STATE.transportManagementFrame, (STATE.transportManagementFrame.GetName and STATE.transportManagementFrame:GetName()) or "STATE.transportManagementFrame")
-        end
-
-        if STATE.interfacePanel then
-            CwEnsureModalFrame(STATE.interfacePanel, (STATE.interfacePanel.GetName and STATE.interfacePanel:GetName()) or "STATE.interfacePanel")
-        end
-
-        if STATE.waypointMetadataPopup and STATE.waypointMetadataPopup.frame then
-            CwEnsureModalFrame(STATE.waypointMetadataPopup.frame, "CustomWaypointsWaypointMetadataPopup")
-            CwEnsureModalEditBox(STATE.waypointMetadataPopup.nameBox, STATE.waypointMetadataPopup.frame)
-            CwEnsureModalEditBox(STATE.waypointMetadataPopup.labelBox, STATE.waypointMetadataPopup.frame)
-            CwEnsureModalEditBox(STATE.waypointMetadataPopup.descBox, STATE.waypointMetadataPopup.frame)
-        end
-
-        if STATE.knownLocationImportPopup and STATE.knownLocationImportPopup.frame then
-            CwEnsureModalFrame(STATE.knownLocationImportPopup.frame, "CustomWaypointsKnownLocationsImportPopup")
-            CwEnsureModalEditBox(STATE.knownLocationImportPopup.editBox, STATE.knownLocationImportPopup.frame)
-        end
-
-        if STATE.knownRouteEditorPopup and STATE.knownRouteEditorPopup.frame then
-            CwEnsureModalFrame(STATE.knownRouteEditorPopup.frame, "CustomWaypointsKnownRouteEditorPopup")
-            CwEnsureModalEditBox(STATE.knownRouteEditorPopup.editor, STATE.knownRouteEditorPopup.frame)
-        end
-
-        if STATE.tuningUi and STATE.tuningUi.frame then
-            CwEnsureModalFrame(STATE.tuningUi.frame, "CustomWaypointsRoutingTuningFrame")
-        end
-
-        if STATE.confirmationFrame then
-            CwEnsureModalFrame(STATE.confirmationFrame, "CustomWaypointsTransportConfirmationFrame")
-        end
-    end
-
-    local function CwTryHookNamedFrames()
-        for _, frameName in ipairs(CW_MODAL_FRAME_NAMES) do
-            local frameRef = _G[frameName]
-            if frameRef then
-                CwEnsureModalFrame(frameRef, frameName)
-                CwRemoveFromSpecialFrames(frameName)
-            end
-        end
-    end
-
-    local function CwTrimModalStack()
-        if not STATE or not STATE.cwModalStack then return end
-        for i = #STATE.cwModalStack, 1, -1 do
-            local f = STATE.cwModalStack[i]
-            if not f or (f.IsShown and not f:IsShown()) then
-                table.remove(STATE.cwModalStack, i)
-            end
-        end
-    end
-
-    local hooker = CreateFrame("Frame", "CustomWaypointsModalHookFrame", UIParent)
-    hooker.elapsed = 0
-    hooker:SetScript("OnUpdate", function(self, elapsed)
-        self.elapsed = (self.elapsed or 0) + (elapsed or 0)
-        if self.elapsed < 0.15 then return end
-        self.elapsed = 0
-        CwTryHookNamedFrames()
-        CwTryHookStateFrames()
-        CwTrimModalStack()
-    end)
-end
-
-
-

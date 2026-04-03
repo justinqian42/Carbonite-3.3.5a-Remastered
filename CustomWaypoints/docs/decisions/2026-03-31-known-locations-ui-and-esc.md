@@ -14,9 +14,16 @@
 - Remove keyboard-capture ESC handling from top-level addon windows and rely on `UISpecialFrames`.
 
 ## Rationale
-This preserves routing semantics while improving UX and keeping top-level window behavior aligned with the client UI model.
+This preserves routing semantics while improving UX and ensures ESC closes only the most recently used CustomWaypoints frame instead of cascading through unrelated addon windows.
 
 ## Non-goals
 - no routing graph redesign
 - no queue/history redesign
 - no sync redesign
+
+
+## 2026-04-03 follow-up
+- ESC close order is intended to be modal/MRU within CustomWaypoints windows.
+- Known Locations should close before the main CW UI when both are open.
+- Routing Tuning should close directly on ESC.
+- `UISpecialFrames` is not the desired primary close-order mechanism for overlapping CW windows.

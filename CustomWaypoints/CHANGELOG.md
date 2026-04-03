@@ -28,3 +28,6 @@
 - Added Known Locations export/import buttons; export writes a portable copy/paste block to the CW log, and import performs union + dedup instead of replacing the existing library.
 - Known-route dedup now compares the full ordered waypoint chain, so multi-waypoint paths no longer collide only by destination.
 - Save captured waypoint / save here now default to a short `wp` label, and Carbonite hover text replaces generic walk wording with the custom label when one exists.
+
+
+- Fixed CW ESC close ordering so overlapping addon windows close by modal recency; Known Locations should close before the main UI, and Routing Tuning should close directly on ESC.

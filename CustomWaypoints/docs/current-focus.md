@@ -47,3 +47,10 @@ Stabilization of Known Locations system, keybinding reliability, and Carbonite c
 
 ## Next safe step
 - add optional late-bind / rebind diagnostics for addon-native keybindings
+
+
+## 2026-04-03
+- ESC behavior target:
+  - most recently used CW window closes first
+  - Known Locations should not also close the main UI on the same ESC
+  - Routing Tuning should close on ESC
