@@ -1,4 +1,4 @@
-﻿-- ============================================================================
+-- ============================================================================
 -- CustomWaypoints - Phase 5B (patched UI + safer deep fallback)
 --
 -- PURPOSE
@@ -379,6 +379,8 @@ STATE = {
     -- Skip auto-advance for a few seconds after capture so nearby clicks / bad coords don't instantly pop.
     lastCaptureTime = 0,
     lastStablePlayerPos = nil,
+    lastNonInstanceStablePlayerPos = nil,
+    lastInstanceStablePlayerPos = nil,
     pendingTransport = nil,
     lastTransportScan = 0,
     confirmationFrame = nil,
@@ -389,38 +391,18 @@ STATE = {
     recentConfirmation = nil,
     activeConfirmationKey = nil,
     pendingTransportKey = nil,
+    recentInstanceEntryKey = nil,
+    recentInstanceEntryUntil = 0,
     cwModalStack = {},
     pendingDeathAutoRoute = nil,
     lastDeathAutoRouteKey = nil,
+    mapSaveRouteButtonHooksInstalled = false,
 }
 
-local InvalidateRoute
-local ClearCarboniteTargets
-local SyncQueueToCarbonite
-local SlashHandler
-local InstallCarboniteSclGuard
-local EnsureInterfaceOptionsPanel
-local EnsureRoutingTuningUi
-local RefreshRoutingTuningUi
-local ShowKnownLocationsFrame
-local RefreshKnownLocationsFrame
-local RouteToKnownLocation
-local SelectKnownLocation
-local ShowKnownLocationImportPopup
-local ExportKnownLocations
-local ImportKnownLocationsFromText
-local EnsureKnownLocationsBinding
-local EnsureSaveHereBinding
-local InstallUndoRedoBindings
-
--- Lua 5.1: closures in InstallUndoRedoBindings must capture these locals, not a later global.
-local UndoHistory, RedoHistory
--- EnsureUi Import button closes over this local (WoW Lua resolves nested refs like globals otherwise).
-local ImportWaypointsFromText
-local SplitLines
-local NormalizeImportLine
-local ParseExportLine
-local SplitExportFields
+-- NOTE:
+-- Removed top-level forward local declarations here to stay below the
+-- Lua 5.1 main-chunk local-variable limit. The corresponding symbols are
+-- assigned later in the file before runtime use.
 
 -- Lexical: must be above InstallUndoRedoBindings if that helper ever calls GetMap at install time.
 local function GetMap()
@@ -461,8 +443,11 @@ function BuildTransportConfirmationKey(fromPos, toPos)
     if not fromPos or not toPos then return nil end
 
     if toPos.instance then
+        -- Instance entry confirmations must stay stable even when the outdoor
+        -- entrance coords wobble or are unavailable on manual entries.
         return table.concat({
             "instance",
+            tostring(fromPos.maI or "?"),
             tostring(toPos.maI or "?"),
             NormalizeKnownInstanceName(toPos),
             tostring(toPos.instanceType or "instance"),
@@ -516,6 +501,38 @@ local function WasConfirmationRecentlyHandled(fromPos, toPos)
     return r.key == BuildTransportConfirmationKey(fromPos, toPos)
 end
 
+function CW.BuildInstanceEntryDedupeKey(fromPos, toPos)
+    if not fromPos or not toPos or not toPos.instance then return nil end
+    return table.concat({
+        "instance-entry",
+        tostring(fromPos.maI or "?"),
+        tostring(toPos.maI or "?"),
+        NormalizeKnownInstanceName(toPos),
+        tostring(toPos.instanceType or "instance"),
+    }, "|")
+end
+
+function CW.IsRecentInstanceEntryDuplicate(fromPos, toPos)
+    local key = CW.BuildInstanceEntryDedupeKey(fromPos, toPos)
+    if not key then return false end
+
+    local now = GetTime and GetTime() or 0
+    if now > (STATE.recentInstanceEntryUntil or 0) then
+        STATE.recentInstanceEntryKey = nil
+        STATE.recentInstanceEntryUntil = 0
+        return false
+    end
+
+    return STATE.recentInstanceEntryKey == key
+end
+
+function CW.RememberRecentInstanceEntry(fromPos, toPos, seconds)
+    local key = CW.BuildInstanceEntryDedupeKey(fromPos, toPos)
+    if not key then return end
+    STATE.recentInstanceEntryKey = key
+    STATE.recentInstanceEntryUntil = (GetTime and GetTime() or 0) + (seconds or 4)
+end
+
 
 local CW_ESC_OVERRIDE_BUTTON_NAME = "CustomWaypointsEscOverrideButton"
 
@@ -556,7 +573,11 @@ HideTopCwModalFrame = function()
     for i = #stack, 1, -1 do
         local f = stack[i]
         if f and f.IsShown and f:IsShown() then
-            f:Hide()
+            if f.cwEscAction then
+                f.cwEscAction(f)
+            else
+                f:Hide()
+            end
             RefreshCwEscOverride()
             return true
         end
@@ -770,12 +791,6 @@ EnsureRoutingTuningUi = function()
     local title = f:CreateFontString(nil, 'OVERLAY', 'GameFontNormal')
     title:SetPoint('TOPLEFT', f, 'TOPLEFT', 12, -10)
     title:SetText('Routing tuning')
-
-    local subtitle = f:CreateFontString(nil, 'OVERLAY', 'GameFontHighlightSmall')
-    subtitle:SetPoint('TOPLEFT', title, 'BOTTOMLEFT', 0, -8)
-    subtitle:SetWidth(488)
-    subtitle:SetJustifyH('LEFT')
-    subtitle:SetText('Sliders apply on release/close to reduce lag. Reset returns a slider to default.')
 
     local close = CreateFrame('Button', nil, f, 'UIPanelCloseButton')
     close:SetPoint('TOPRIGHT', f, 'TOPRIGHT', -2, -2)
@@ -1334,6 +1349,94 @@ local function FinalizeImportedKnownLocation(header, routePoints)
     }, nil
 end
 
+local function NormalizeOptionalMetadataField(value)
+    if value == nil then return nil end
+    value = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if value == "" or value == "?" then
+        return nil
+    end
+    return value
+end
+
+local function SanitizeRoutePointForEditing(pt)
+    local copy = CloneDestination(pt) or {}
+
+    copy.userName = NormalizeOptionalMetadataField(copy.userName)
+    copy.userLabel = NormalizeOptionalMetadataField(copy.userLabel)
+
+    local rawTs = tostring(copy.ts or "?")
+    local baseTs, trailing = rawTs:match("^(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)(.+)$")
+    if baseTs then
+        copy.ts = baseTs
+        trailing = NormalizeOptionalMetadataField(trailing)
+        if trailing then
+            if not copy.userName then
+                copy.userName = trailing
+            elseif not copy.userLabel then
+                copy.userLabel = trailing
+            end
+        end
+    else
+        local normalizedTs = NormalizeOptionalMetadataField(rawTs)
+        copy.ts = normalizedTs or "?"
+    end
+
+    return copy
+end
+
+local function BuildSingleKnownLocationImportBlock(loc)
+    if not loc then return "" end
+
+    local lines = {}
+
+    if loc.sourceType == "learnedTransport" then
+        local edge = nil
+        local learned = EnsureTransportDb() or {}
+        if loc.sourceIndex and learned[loc.sourceIndex] then
+            edge = learned[loc.sourceIndex]
+        end
+        if not edge and loc.previousTarget and loc.lastTarget then
+            edge = {
+                fromMaI = loc.previousTarget.maI,
+                fromMapName = loc.previousTarget.mapName,
+                fromZx = loc.previousTarget.zx,
+                fromZy = loc.previousTarget.zy,
+                fromWx = loc.previousTarget.wx,
+                fromWy = loc.previousTarget.wy,
+                toMaI = loc.lastTarget.maI,
+                toMapName = loc.lastTarget.mapName,
+                toZx = loc.lastTarget.zx,
+                toZy = loc.lastTarget.zy,
+                toWx = loc.lastTarget.wx,
+                toWy = loc.lastTarget.wy,
+                label = loc.name,
+                fromInstance = loc.previousTarget.instance,
+                fromInstanceType = loc.previousTarget.instanceType,
+                toInstance = loc.lastTarget.instance,
+                toInstanceType = loc.lastTarget.instanceType,
+            }
+        end
+        if not edge then return "" end
+
+        lines[#lines + 1] = BuildLearnedTransportExportHeader(edge)
+        lines[#lines + 1] = SerializeLearnedTransportLine(edge)
+        return table.concat(lines, "\n")
+    end
+
+    lines[#lines + 1] = BuildKnownLocationExportHeader(loc)
+
+    if loc.kind == "route" then
+        lines[#lines + 1] = SerializeRoutePointsBlock(loc.routePoints or {})
+    else
+        local dest = loc.destination or loc.lastTarget or loc.previousTarget
+        if dest then
+            lines[#lines + 1] = SerializeWaypointLine(1, SanitizeRoutePointForEditing(dest))
+        end
+    end
+
+    return table.concat(lines, "\n")
+end
+
 local function DeduplicateKnownLocationsPreserveOrder(list)
     local out = {}
     local seen = {}
@@ -1527,6 +1630,9 @@ local function EntryMatchesFilters(entry, ui)
     if ui and ui.routesOnly and not (entry.kind == "route" and entry.sourceType == "knownRoute") then
         return false
     end
+    if ui and ui.transportsOnly and entry.sourceType ~= "learnedTransport" then
+        return false
+    end
     if ui and ui.instancesOnly and not entry.instance then
         return false
     end
@@ -1565,41 +1671,6 @@ local function ResolveKnownLocationStoredSourceIndex(entry)
     end
 
     return nil
-end
-
-local function NormalizeOptionalMetadataField(value)
-    if value == nil then return nil end
-    value = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if value == "" or value == "?" then
-        return nil
-    end
-    return value
-end
-
-local function SanitizeRoutePointForEditing(pt)
-    local copy = CloneDestination(pt) or {}
-
-    copy.userName = NormalizeOptionalMetadataField(copy.userName)
-    copy.userLabel = NormalizeOptionalMetadataField(copy.userLabel)
-
-    local rawTs = tostring(copy.ts or "?")
-    local baseTs, trailing = rawTs:match("^(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)(.+)$")
-    if baseTs then
-        copy.ts = baseTs
-        trailing = NormalizeOptionalMetadataField(trailing)
-        if trailing then
-            if not copy.userName then
-                copy.userName = trailing
-            elseif not copy.userLabel then
-                copy.userLabel = trailing
-            end
-        end
-    else
-        local normalizedTs = NormalizeOptionalMetadataField(rawTs)
-        copy.ts = normalizedTs or "?"
-    end
-
-    return copy
 end
 
 local function SanitizeRoutePointsForEditing(routePoints)
@@ -1764,42 +1835,541 @@ local function DeleteKnownLocationEntry(entry)
 
     if entry.sourceType == "learnedTransport" then
         local learned = EnsureTransportDb()
-        if not learned[entry.sourceIndex] then
+        local transportIndex = entry.sourceIndex
+        if (not transportIndex or not learned[transportIndex]) and entry.key then
+            for i, candidate in ipairs(BuildKnownLocationEntries()) do
+                if candidate.key == entry.key and candidate.sourceType == "learnedTransport" then
+                    transportIndex = candidate.sourceIndex
+                    break
+                end
+            end
+        end
+        if not transportIndex or not learned[transportIndex] then
             pr("delete failed: learned transport not found")
             return false
         end
-        table.remove(learned, entry.sourceIndex)
+        table.remove(learned, transportIndex)
         InvalidateRoute("deleted learned transport from known locations")
-        pr("deleted learned transport: " .. tostring(entry.name or entry.sourceIndex))
+        pr("deleted learned transport: " .. tostring(entry.name or transportIndex))
         return true
     end
 
     local known = STATE.db.knownLocations or {}
-    if not entry.sourceIndex or not known[entry.sourceIndex] then
+    local sourceIndex = ResolveKnownLocationStoredSourceIndex(entry)
+    if (not sourceIndex or not known[sourceIndex]) and entry.key then
+        local wantedSignature = BuildKnownLocationSignature(entry)
+        for i, candidate in ipairs(known) do
+            if tostring(candidate.key or "") == tostring(entry.key or "") then
+                sourceIndex = i
+                break
+            end
+            if wantedSignature and BuildKnownLocationSignature(candidate) == wantedSignature then
+                sourceIndex = i
+                break
+            end
+        end
+    end
+    if not sourceIndex or not known[sourceIndex] then
         pr("delete failed: known location not found")
         return false
     end
 
-    local removed = known[entry.sourceIndex]
-    table.remove(known, entry.sourceIndex)
+    local removed = known[sourceIndex]
+    table.remove(known, sourceIndex)
+
+    if STATE.knownLocationsUi then
+        STATE.knownLocationsUi.selectedIndex = nil
+        STATE.knownLocationsUi.lastClickKey = nil
+    end
+
     InvalidateRoute("deleted known location entry")
-    pr("deleted known location: " .. tostring((removed and removed.name) or entry.name or entry.sourceIndex))
+    pr("deleted known location: " .. tostring((removed and removed.name) or entry.name or sourceIndex))
     return true
 end
 
-local function EnsurePopupEsc(frameName)
-    if UISpecialFrames then
-        local exists = false
-        for _, v in ipairs(UISpecialFrames) do
-            if v == frameName then
-                exists = true
-                break
-            end
-        end
-        if not exists then
-            tinsert(UISpecialFrames, frameName)
+local function TrimEditorMetadataValue(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+CloneLearnedTransport = function(edge)
+    local copy = {}
+    for k, v in pairs(edge or {}) do
+        copy[k] = v
+    end
+    return copy
+end
+
+local function FindDuplicateLearnedTransportIndex(candidate, skipIndex)
+    local wanted = LearnedTransportKey(candidate)
+    if not wanted then return nil end
+    local learned = EnsureTransportDb() or {}
+    for i, edge in ipairs(learned) do
+        if i ~= skipIndex and LearnedTransportKey(edge) == wanted then
+            return i
         end
     end
+    return nil
+end
+
+local function ShowKnownPointEditorPopup(sourceIndex, loc, titleText)
+    local frameName = "CustomWaypointsKnownPointEditorPopup"
+
+    if STATE.knownPointEditorPopup and STATE.knownPointEditorPopup.frame then
+        STATE.knownPointEditorPopup.frame:Hide()
+    end
+
+    local f = CreateFrame("Frame", frameName, UIParent)
+    f:SetWidth(560)
+    f:SetHeight(420)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(96)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then
+            self:Hide()
+        end
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.92)
+
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    title:SetText(titleText or "Edit known location")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -34)
+    subtitle:SetWidth(520)
+    subtitle:SetJustifyH("LEFT")
+    subtitle:SetText("Edit metadata plus the full saved import block for this entry. One exported line per line; order is preserved.")
+
+    local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -64)
+    nameLabel:SetText("Name")
+
+    local nameBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    nameBox:SetAutoFocus(false)
+    nameBox:SetWidth(330)
+    nameBox:SetHeight(20)
+    nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
+    nameBox:SetText(loc.name or "")
+
+    local labelLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    labelLabel:SetPoint("TOPLEFT", nameLabel, "BOTTOMLEFT", 0, -18)
+    labelLabel:SetText("Label")
+
+    local labelBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    labelBox:SetAutoFocus(false)
+    labelBox:SetWidth(330)
+    labelBox:SetHeight(20)
+    labelBox:SetPoint("LEFT", labelLabel, "RIGHT", 10, 0)
+    labelBox:SetText(loc.label or "")
+
+    local descLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    descLabel:SetPoint("TOPLEFT", labelLabel, "BOTTOMLEFT", 0, -18)
+    descLabel:SetText("Description")
+
+    local descBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    descBox:SetAutoFocus(false)
+    descBox:SetWidth(330)
+    descBox:SetHeight(20)
+    descBox:SetPoint("LEFT", descLabel, "RIGHT", 10, 0)
+    descBox:SetText(loc.description or "")
+
+    local pointLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    pointLabel:SetPoint("TOPLEFT", descLabel, "BOTTOMLEFT", 0, -22)
+    pointLabel:SetText("Import block")
+
+    local scroll = CreateFrame("ScrollFrame", frameName .. "Scroll", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", pointLabel, "BOTTOMLEFT", 0, -8)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -40, 48)
+
+    local editor = CreateFrame("EditBox", nil, scroll)
+    editor:SetAutoFocus(false)
+    editor:SetMultiLine(true)
+    editor:SetFontObject(GameFontHighlightSmall)
+    editor:SetWidth(500)
+    editor:SetTextInsets(4, 4, 4, 4)
+    editor:SetJustifyH("LEFT")
+    editor:SetText(EscapeForDisplay(BuildSingleKnownLocationImportBlock(loc)))
+    editor:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    editor:SetScript("OnCursorChanged", function(self)
+        if scroll.SetHorizontalScroll then scroll:SetHorizontalScroll(0) end
+    end)
+    editor:SetScript("OnTextChanged", function(self)
+        local editorText = self:GetText() or ""
+        local _, newlineCount = string.gsub(editorText, "\n", "\n")
+        local lines = newlineCount + 1
+        local _, fontHeight = self:GetFont()
+        fontHeight = fontHeight or 14
+        self:SetHeight(math.max(220, lines * fontHeight + fontHeight * 2))
+        if scroll.UpdateScrollChildRect then
+            scroll:UpdateScrollChildRect()
+        end
+    end)
+    scroll:SetScrollChild(editor)
+    editor:GetScript("OnTextChanged")(editor)
+
+    local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    saveBtn:SetWidth(90)
+    saveBtn:SetHeight(24)
+    saveBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 16)
+    saveBtn:SetText("Save")
+
+    local cancelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    cancelBtn:SetWidth(90)
+    cancelBtn:SetHeight(24)
+    cancelBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 16)
+    cancelBtn:SetText("Cancel")
+    cancelBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function() f:Hide() end)
+
+    saveBtn:SetScript("OnClick", function()
+        local text = UnescapeFromDisplay(editor:GetText() or "")
+        local imported = {}
+        local importedTransports = {}
+        local pendingHeader = nil
+        local pendingRoutePoints = {}
+        local bad = 0
+
+        local function flushPending()
+            if not pendingHeader then return end
+            if pendingHeader.kind == "transport" then
+                if #pendingRoutePoints == 1 and pendingRoutePoints[1]._transportEdge then
+                    importedTransports[#importedTransports + 1] = pendingRoutePoints[1]._transportEdge
+                else
+                    bad = bad + 1
+                end
+            else
+                local parsedLoc, why = FinalizeImportedKnownLocation(pendingHeader, pendingRoutePoints)
+                if parsedLoc then
+                    imported[#imported + 1] = parsedLoc
+                else
+                    bad = bad + 1
+                    dbg("known location edit parse rejected: " .. tostring(why or "?"))
+                end
+            end
+            pendingHeader = nil
+            pendingRoutePoints = {}
+        end
+
+        for _, rawLine in ipairs(SplitLines(text)) do
+            local line = NormalizeImportLine(rawLine)
+            local header = ParseKnownLocationHeader(line)
+            if line == "" or string.find(line, "COPY KNOWN LOCATIONS", 1, true) then
+                -- skip
+            elseif header then
+                flushPending()
+                pendingHeader = header
+            elseif pendingHeader and pendingHeader.kind == "transport" then
+                local edge, why = ParseLearnedTransportLine(line)
+                if edge then
+                    pendingRoutePoints[#pendingRoutePoints + 1] = { _transportEdge = edge }
+                elseif why and why ~= "empty" and why ~= "marker" then
+                    bad = bad + 1
+                end
+            else
+                local dest, why = ParseExportLine(line)
+                if dest and pendingHeader then
+                    dest._importOrder = nil
+                    pendingRoutePoints[#pendingRoutePoints + 1] = dest
+                elseif why and why ~= "empty" and why ~= "marker" then
+                    bad = bad + 1
+                end
+            end
+        end
+        flushPending()
+
+        if bad > 0 then
+            pr("known location edit failed: remove invalid line(s) first")
+            return
+        end
+
+        local parsedLoc = imported[1]
+        local parsedTransport = importedTransports[1]
+
+        if loc.sourceType == "learnedTransport" then
+            if #importedTransports ~= 1 or #imported ~= 0 then
+                pr("known location edit failed: paste exactly one valid transport block")
+                return
+            end
+
+            local learned = EnsureTransportDb() or {}
+            local storedIndex = sourceIndex
+            local edge = learned[storedIndex]
+            if not edge then
+                pr("known location edit failed: learned transport not found")
+                return
+            end
+
+            edge.label = TrimEditorMetadataValue(labelBox:GetText())
+            if edge.label == "" then
+                edge.label = nil
+            end
+
+            edge.fromMaI = parsedTransport.fromMaI
+            edge.fromMapName = parsedTransport.fromMapName
+            edge.fromZx = parsedTransport.fromZx
+            edge.fromZy = parsedTransport.fromZy
+            edge.fromWx = parsedTransport.fromWx
+            edge.fromWy = parsedTransport.fromWy
+            edge.toMaI = parsedTransport.toMaI
+            edge.toMapName = parsedTransport.toMapName
+            edge.toZx = parsedTransport.toZx
+            edge.toZy = parsedTransport.toZy
+            edge.toWx = parsedTransport.toWx
+            edge.toWy = parsedTransport.toWy
+            edge.fromInstance = parsedTransport.fromInstance
+            edge.fromInstanceType = parsedTransport.fromInstanceType
+            edge.toInstance = parsedTransport.toInstance
+            edge.toInstanceType = parsedTransport.toInstanceType
+            if parsedTransport.label and parsedTransport.label ~= "" then
+                edge.label = parsedTransport.label
+            end
+
+            RefreshKnownLocationsFrame()
+            InvalidateRoute("edited known transport from unified editor")
+            pr("updated known transport: " .. tostring(edge.label or loc.name or sourceIndex))
+            f:Hide()
+            return
+        end
+
+        if #imported ~= 1 or #importedTransports ~= 0 then
+            pr("known location edit failed: paste exactly one valid known-location block")
+            return
+        end
+
+        local candidate = CloneDestination(parsedLoc)
+        candidate.name = TrimEditorMetadataValue(nameBox:GetText())
+        candidate.label = TrimEditorMetadataValue(labelBox:GetText())
+        candidate.description = descBox:GetText() or ""
+        NormalizeKnownLocationAfterEdit(candidate)
+
+        local duplicateIndex = FindDuplicateKnownLocationIndex(candidate, sourceIndex)
+        if duplicateIndex then
+            pr("known location edit skipped: duplicate of existing known location #" .. tostring(duplicateIndex))
+            return
+        end
+
+        loc.name = candidate.name ~= "" and candidate.name or loc.name
+        loc.label = candidate.label ~= "" and candidate.label or nil
+        loc.description = candidate.description ~= "" and candidate.description or nil
+        loc.kind = candidate.kind or loc.kind
+        loc.instance = candidate.instance
+        loc.instanceType = candidate.instanceType
+        loc.destination = candidate.destination
+        loc.mapName = candidate.mapName
+        loc.routePoints = candidate.routePoints
+
+        RefreshKnownLocationsFrame()
+        pr("updated known location: " .. tostring(loc.name or sourceIndex))
+        f:Hide()
+    end)
+
+    f:SetScript("OnHide", function(self)
+        if nameBox and nameBox.ClearFocus then nameBox:ClearFocus() end
+        if labelBox and labelBox.ClearFocus then labelBox:ClearFocus() end
+        if descBox and descBox.ClearFocus then descBox:ClearFocus() end
+        if editor and editor.ClearFocus then editor:ClearFocus() end
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+        if STATE.knownPointEditorPopup and STATE.knownPointEditorPopup.frame == self then
+            STATE.knownPointEditorPopup = nil
+        end
+    end)
+
+    
+    STATE.knownPointEditorPopup = { frame = f, editor = editor }
+    ArmKeyboardModalFrame(f)
+    f:Show()
+    if nameBox.SetFocus then nameBox:SetFocus() end
+end
+
+local function ShowKnownTransportEditorPopup(sourceIndex, edge)
+    local frameName = "CustomWaypointsKnownTransportEditorPopup"
+
+    if STATE.knownTransportEditorPopup and STATE.knownTransportEditorPopup.frame then
+        STATE.knownTransportEditorPopup.frame:Hide()
+    end
+
+    local f = CreateFrame("Frame", frameName, UIParent)
+    f:SetWidth(560)
+    f:SetHeight(280)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(96)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then
+            self:Hide()
+        end
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.92)
+
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    title:SetText("Edit known transport")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -34)
+    subtitle:SetWidth(520)
+    subtitle:SetJustifyH("LEFT")
+    subtitle:SetText("Edit the saved transport label plus its transport line.")
+
+    local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -64)
+    nameLabel:SetText("Name")
+
+    local nameBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    nameBox:SetAutoFocus(false)
+    nameBox:SetWidth(330)
+    nameBox:SetHeight(20)
+    nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
+    nameBox:SetText(edge.label or TransportLabel(edge) or "")
+
+    local lineLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    lineLabel:SetPoint("TOPLEFT", nameLabel, "BOTTOMLEFT", 0, -22)
+    lineLabel:SetText("Transport line")
+
+    local editor = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    editor:SetAutoFocus(false)
+    editor:SetWidth(520)
+    editor:SetHeight(90)
+    editor:SetPoint("TOPLEFT", lineLabel, "BOTTOMLEFT", 0, -8)
+    editor:SetMultiLine(true)
+    editor:SetFontObject(GameFontHighlightSmall)
+    editor:SetTextInsets(4, 4, 4, 4)
+    editor:SetJustifyH("LEFT")
+    editor:SetText(EscapeForDisplay(table.concat({
+        BuildLearnedTransportExportHeader(edge),
+        SerializeLearnedTransportLine(edge)
+    }, "\n")))
+    editor:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+    local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    saveBtn:SetWidth(90)
+    saveBtn:SetHeight(24)
+    saveBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 16)
+    saveBtn:SetText("Save")
+
+    local cancelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    cancelBtn:SetWidth(90)
+    cancelBtn:SetHeight(24)
+    cancelBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 16)
+    cancelBtn:SetText("Cancel")
+    cancelBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function() f:Hide() end)
+
+    saveBtn:SetScript("OnClick", function()
+        local lines = SplitLines(UnescapeFromDisplay(editor:GetText() or ""))
+        local parsed = nil
+        local bad = 0
+        local validCount = 0
+
+        for _, line in ipairs(lines or {}) do
+            local normalized = NormalizeImportLine(line)
+            if normalized ~= "" then
+                local edgeCandidate, why = ParseLearnedTransportLine(normalized)
+                if edgeCandidate then
+                    validCount = validCount + 1
+                    parsed = edgeCandidate
+                elseif why ~= "empty" then
+                    bad = bad + 1
+                end
+            end
+        end
+
+        if validCount ~= 1 then
+            pr("known transport edit failed: paste exactly one valid transport line")
+            return
+        end
+        if bad > 0 then
+            pr("known transport edit failed: remove invalid line(s) first")
+            return
+        end
+
+        local candidate = CloneLearnedTransport(parsed)
+        candidate.label = TrimEditorMetadataValue(nameBox:GetText())
+
+        local duplicateIndex = FindDuplicateLearnedTransportIndex(candidate, sourceIndex)
+        if duplicateIndex then
+            pr("known transport edit skipped: duplicate of existing transport #" .. tostring(duplicateIndex))
+            return
+        end
+
+        local learned = EnsureTransportDb()
+        local target = learned[sourceIndex]
+        if not target then
+            pr("known transport edit failed: learned transport not found")
+            return
+        end
+
+        for k in pairs(target) do
+            target[k] = nil
+        end
+        for k, v in pairs(candidate) do
+            target[k] = v
+        end
+
+        RefreshKnownLocationsFrame()
+        InvalidateRoute("edited learned transport from known locations")
+        pr("updated known transport: " .. tostring(target.label or TransportLabel(target) or sourceIndex))
+        f:Hide()
+    end)
+
+    f:SetScript("OnHide", function(self)
+        if nameBox and nameBox.ClearFocus then nameBox:ClearFocus() end
+        if editor and editor.ClearFocus then editor:ClearFocus() end
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+        if STATE.knownTransportEditorPopup and STATE.knownTransportEditorPopup.frame == self then
+            STATE.knownTransportEditorPopup = nil
+        end
+    end)
+
+    ArmKeyboardModalFrame(f)
+    STATE.knownTransportEditorPopup = { frame = f, editor = editor }
+    f:Show()
+    if nameBox.SetFocus then nameBox:SetFocus() end
 end
 
 local function ShowKnownRouteEditorPopup(sourceIndex, loc)
@@ -1834,8 +2404,8 @@ local function ShowKnownRouteEditorPopup(sourceIndex, loc)
 
     if f.SetBackdrop then
         f:SetBackdrop({
-            bgFile = "Interface\DialogFrame\UI-DialogBox-Background",
-            edgeFile = "Interface\Tooltips\UI-Tooltip-Border",
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
             tile = true, tileSize = 16, edgeSize = 16,
             insets = { left = 4, right = 4, top = 4, bottom = 4 }
         })
@@ -1850,6 +2420,8 @@ local function ShowKnownRouteEditorPopup(sourceIndex, loc)
     subtitle:SetWidth(520)
     subtitle:SetJustifyH("LEFT")
     subtitle:SetText("Edit metadata plus all saved waypoint lines for this route. One exported waypoint per line; order is preserved.")
+
+    local CommitWaypointMetadataPopup
 
     local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -64)
@@ -1989,7 +2561,7 @@ local function ShowKnownRouteEditorPopup(sourceIndex, loc)
         end
     end)
 
-    EnsurePopupEsc(frameName)
+    ArmKeyboardModalFrame(f)
     STATE.knownRouteEditorPopup = { frame = f, editor = editor }
     f:Show()
     if nameBox.SetFocus then nameBox:SetFocus() end
@@ -1998,84 +2570,198 @@ end
 ShowKnownLocationEditorPopup = function(sourceIndex)
     EnsureDb()
 
-    if type(sourceIndex) == "table" and sourceIndex.sourceType == "learnedTransport" then
-        pr("edit skipped: discovered portals are not editable yet")
-        return
+    local function BuildTransportEditorEntry(storedIndex, edge)
+        if not edge then return nil end
+        return {
+            sourceType = "learnedTransport",
+            sourceIndex = storedIndex,
+            kind = "transport",
+            name = TransportLabel(edge),
+            label = edge.label,
+            previousTarget = {
+                maI = edge.fromMaI, mapName = edge.fromMapName, zx = edge.fromZx, zy = edge.fromZy, wx = edge.fromWx, wy = edge.fromWy,
+                instance = edge.fromInstance, instanceType = edge.fromInstanceType,
+            },
+            lastTarget = {
+                maI = edge.toMaI, mapName = edge.toMapName, zx = edge.toZx, zy = edge.toZy, wx = edge.toWx, wy = edge.toWy,
+                instance = edge.toInstance, instanceType = edge.toInstanceType,
+            },
+        }
     end
 
-    local resolvedSourceIndex = nil
+    local function OpenUnifiedEditor(storedIndex, entry)
+        if not entry then
+            pr("edit failed: known location not found")
+            return
+        end
+        local titleText = "Edit known location"
+        if entry.sourceType == "learnedTransport" or entry.kind == "transport" then
+            titleText = "Edit known transport"
+        elseif entry.kind == "route" then
+            titleText = "Edit known route"
+        elseif entry.kind == "instance" then
+            titleText = "Edit known instance"
+        end
+        ShowKnownPointEditorPopup(storedIndex, entry, titleText)
+    end
 
     if type(sourceIndex) == "table" then
-        resolvedSourceIndex = ResolveKnownLocationStoredSourceIndex(sourceIndex)
-    else
-        resolvedSourceIndex = tonumber(sourceIndex)
-
-        local direct = resolvedSourceIndex and STATE.db.knownLocations and STATE.db.knownLocations[resolvedSourceIndex] or nil
-        if not direct and resolvedSourceIndex and STATE.knownLocationsUi and STATE.knownLocationsUi.visibleEntries then
-            local visibleEntry = STATE.knownLocationsUi.visibleEntries[resolvedSourceIndex]
-            if visibleEntry and visibleEntry.sourceType == "learnedTransport" then
-                pr("edit skipped: discovered portals are not editable yet")
+        if sourceIndex.sourceType == "learnedTransport" then
+            local learned = EnsureTransportDb()
+            local edge = sourceIndex.sourceIndex and learned[sourceIndex.sourceIndex] or nil
+            if not edge then
+                pr("edit failed: learned transport not found")
                 return
             end
-            if visibleEntry then
-                local mapped = ResolveKnownLocationStoredSourceIndex(visibleEntry)
-                if mapped then
-                    resolvedSourceIndex = mapped
-                end
-            end
+            OpenUnifiedEditor(sourceIndex.sourceIndex, BuildTransportEditorEntry(sourceIndex.sourceIndex, edge))
+            return
         end
 
-        direct = resolvedSourceIndex and STATE.db.knownLocations and STATE.db.knownLocations[resolvedSourceIndex] or nil
-        if not direct and resolvedSourceIndex and STATE.knownLocationsUi and STATE.knownLocationsUi.visibleEntries then
-            local visibleEntry = STATE.knownLocationsUi.visibleEntries[resolvedSourceIndex]
-            if visibleEntry and visibleEntry.sourceType == "learnedTransport" then
-                pr("edit skipped: discovered portals are not editable yet")
-                return
-            end
-            if visibleEntry then
-                resolvedSourceIndex = ResolveKnownLocationStoredSourceIndex(visibleEntry)
-            end
-        end
-    end
-
-    local loc = resolvedSourceIndex and STATE.db.knownLocations and STATE.db.knownLocations[resolvedSourceIndex] or nil
-    if not loc then
-        pr("edit failed: known location not found")
+        local resolvedSourceIndex = ResolveKnownLocationStoredSourceIndex(sourceIndex)
+        local loc = resolvedSourceIndex and STATE.db.knownLocations and STATE.db.knownLocations[resolvedSourceIndex] or nil
+        OpenUnifiedEditor(resolvedSourceIndex, loc)
         return
     end
 
-    if loc.kind == "route" then
-        ShowKnownRouteEditorPopup(resolvedSourceIndex, loc)
+    local resolvedSourceIndex = tonumber(sourceIndex)
+    local visibleEntry = nil
+
+    if resolvedSourceIndex and STATE.knownLocationsUi and STATE.knownLocationsUi.visibleEntries then
+        visibleEntry = STATE.knownLocationsUi.visibleEntries[resolvedSourceIndex]
+    end
+
+    if visibleEntry and visibleEntry.sourceType == "learnedTransport" then
+        local learned = EnsureTransportDb()
+        local edge = visibleEntry.sourceIndex and learned[visibleEntry.sourceIndex] or nil
+        if not edge then
+            pr("edit failed: learned transport not found")
+            return
+        end
+        OpenUnifiedEditor(visibleEntry.sourceIndex, BuildTransportEditorEntry(visibleEntry.sourceIndex, edge))
         return
     end
 
-    ShowWaypointMetadataPopup({
-        title = "Edit known location",
-        defaultName = loc.name or "",
-        defaultLabel = loc.label or "",
-        defaultDescription = loc.description or "",
-        onSave = function(meta)
-            local candidate = CloneDestination(loc)
-            candidate.name = meta.name ~= "" and meta.name or loc.name
-            candidate.label = meta.label ~= "" and meta.label or nil
-            candidate.description = meta.description ~= "" and meta.description or nil
-            NormalizeKnownLocationAfterEdit(candidate)
-
-            local duplicateIndex = FindDuplicateKnownLocationIndex(candidate, resolvedSourceIndex)
-            if duplicateIndex then
-                pr("known location edit skipped: duplicate of existing known location #" .. tostring(duplicateIndex))
-                return
-            end
-
-            loc.name = candidate.name
-            loc.label = candidate.label
-            loc.description = candidate.description
-            loc.destination = candidate.destination
-            loc.mapName = candidate.mapName
-            RefreshKnownLocationsFrame()
-            pr("updated known location: " .. tostring(loc.name or resolvedSourceIndex))
+    local direct = resolvedSourceIndex and STATE.db.knownLocations and STATE.db.knownLocations[resolvedSourceIndex] or nil
+    if not direct and visibleEntry then
+        local mapped = ResolveKnownLocationStoredSourceIndex(visibleEntry)
+        if mapped then
+            resolvedSourceIndex = mapped
+            direct = STATE.db.knownLocations and STATE.db.knownLocations[resolvedSourceIndex] or nil
         end
-    })
+    end
+
+    OpenUnifiedEditor(resolvedSourceIndex, direct)
+end
+
+ShowWaypointImportPopup = function()
+    local frameName = "CustomWaypointsQueueImportPopup"
+
+    if STATE.waypointImportPopup and STATE.waypointImportPopup.frame then
+        STATE.waypointImportPopup.frame:Hide()
+    end
+
+    local f = CreateFrame("Frame", frameName, UIParent)
+    f:SetWidth(560)
+    f:SetHeight(360)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(96)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then
+            self:Hide()
+        end
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.92)
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    title:SetText("Import waypoints")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -34)
+    subtitle:SetWidth(520)
+    subtitle:SetJustifyH("LEFT")
+    subtitle:SetText("Paste a queue export block here. Markers are optional, and copied CW log text with doubled pipes is accepted.")
+
+    local scroll = CreateFrame("ScrollFrame", frameName .. "Scroll", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -62)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 48)
+
+    local editor = CreateFrame("EditBox", nil, scroll)
+    editor:SetMultiLine(true)
+    editor:SetAutoFocus(false)
+    editor:SetFontObject(GameFontHighlightSmall)
+    editor:SetWidth(490)
+    editor:SetTextInsets(4, 4, 4, 4)
+    editor:SetJustifyH("LEFT")
+    editor:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    editor:SetScript("OnTextChanged", function(self)
+        local txt = self:GetText() or ""
+        local _, lineCount = string.gsub(txt, "", "")
+        local lines = lineCount + 1
+        local _, fontHeight = self:GetFont()
+        fontHeight = fontHeight or 14
+        self:SetHeight(math.max(220, lines * fontHeight + fontHeight * 2))
+        if scroll.UpdateScrollChildRect then
+            scroll:UpdateScrollChildRect()
+        end
+    end)
+    scroll:SetScrollChild(editor)
+    editor:SetText("")
+    editor:GetScript("OnTextChanged")(editor)
+
+    local importBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    importBtn:SetWidth(90)
+    importBtn:SetHeight(24)
+    importBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 16)
+    importBtn:SetText("Import")
+
+    local cancelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    cancelBtn:SetWidth(90)
+    cancelBtn:SetHeight(24)
+    cancelBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 16)
+    cancelBtn:SetText("Cancel")
+    cancelBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function() f:Hide() end)
+
+    importBtn:SetScript("OnClick", function()
+        ImportWaypointsFromText(editor:GetText() or "")
+        f:Hide()
+        RefreshUiHeader()
+    end)
+
+    f:SetScript("OnHide", function(self)
+        if editor and editor.ClearFocus then editor:ClearFocus() end
+        if editor and editor.Hide then editor:Hide() end
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+    end)
+
+    ArmKeyboardModalFrame(f)
+    STATE.waypointImportPopup = { frame = f, editor = editor }
+    f:Show()
+    if editor.SetFocus then editor:SetFocus() end
+    ArmKeyboardModalFrame(f)
 end
 
 ShowKnownLocationImportPopup = function()
@@ -2109,8 +2795,8 @@ ShowKnownLocationImportPopup = function()
     bg:SetTexture(0, 0, 0, 0.92)
     if f.SetBackdrop then
         f:SetBackdrop({
-            bgFile = "Interface\DialogFrame\UI-DialogBox-Background",
-            edgeFile = "Interface\Tooltips\UI-Tooltip-Border",
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
             tile = true, tileSize = 16, edgeSize = 16,
             insets = { left = 4, right = 4, top = 4, bottom = 4 }
         })
@@ -2181,8 +2867,9 @@ ShowKnownLocationImportPopup = function()
         if self.EnableKeyboard then self:EnableKeyboard(false) end
     end)
 
-    EnsurePopupEsc(frameName)
+    ArmKeyboardModalFrame(f)
     STATE.knownLocationImportPopup = { frame = f, editor = editor }
+    ArmKeyboardModalFrame(f)
     f:Show()
     if editor.SetFocus then editor:SetFocus() end
 end
@@ -2238,7 +2925,7 @@ RefreshKnownLocationsFrame = function()
 
     for i, entry in ipairs(visibleEntries) do
         local row = CreateFrame("Button", nil, content)
-        row:SetSize(500, 42)
+        row:SetSize(590, 42)
         row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, yOffset)
         row:RegisterForClicks("LeftButtonUp")
         row:SetScript("OnClick", function()
@@ -2290,7 +2977,7 @@ RefreshKnownLocationsFrame = function()
 
         local meta = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         meta:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
-        meta:SetWidth(390)
+        meta:SetWidth(420)
         meta:SetJustifyH("LEFT")
         meta:SetText(format("kind=%s | entrance=%s | destination=%s%s",
             tostring(entry.kind or "?"),
@@ -2363,7 +3050,7 @@ ShowKnownLocationsFrame = function()
     end
 
     local f = CreateFrame("Frame", "CustomWaypointsKnownLocationsFrame", UIParent)
-    f:SetWidth(560)
+    f:SetWidth(650)
     f:SetHeight(390)
     f:SetPoint("CENTER", UIParent, "CENTER", 30, -10)
     f:SetFrameStrata("DIALOG")
@@ -2413,7 +3100,7 @@ ShowKnownLocationsFrame = function()
     subtitle:SetPoint("TOP", title, "BOTTOM", 0, -8)
     subtitle:SetWidth(510)
     subtitle:SetJustifyH("CENTER")
-    subtitle:SetText("Known locations + learned transports. Left click selects, double click routes.")
+    subtitle:SetText("Left click selects, double click routes.")
 
     local searchLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     searchLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 18, -59)
@@ -2464,6 +3151,21 @@ ShowKnownLocationsFrame = function()
     routesLabel:SetPoint("LEFT", routesCheck, "RIGHT", 2, 0)
     routesLabel:SetText("Routes only")
 
+    local transportsCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    transportsCheck:SetPoint("LEFT", routesLabel, "RIGHT", 18, 0)
+    transportsCheck:SetChecked(false)
+    transportsCheck:SetScript("OnClick", function(self)
+        if STATE.knownLocationsUi then
+            STATE.knownLocationsUi.transportsOnly = self:GetChecked() and true or false
+            STATE.knownLocationsUi.selectedIndex = nil
+            RefreshKnownLocationsFrame()
+        end
+    end)
+
+    local transportsLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    transportsLabel:SetPoint("LEFT", transportsCheck, "RIGHT", 2, 0)
+    transportsLabel:SetText("Transports only")
+
     local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
     close:SetScript("OnClick", function() f:Hide() end)
@@ -2476,10 +3178,10 @@ ShowKnownLocationsFrame = function()
     refreshBtn:SetScript("OnClick", function() RefreshKnownLocationsFrame() end)
 
     local scrollFrame = CreateFrame("ScrollFrame", "CustomWaypointsKnownLocationsScrollFrame", f, "UIPanelScrollFrameTemplate")
+    local content = CreateFrame("Frame", nil, scrollFrame)
     scrollFrame:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -88)
     scrollFrame:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -32, 42)
 
-    local content = CreateFrame("Frame", nil, scrollFrame)
     content:SetSize(500, 1)
     scrollFrame:SetScrollChild(content)
 
@@ -2529,6 +3231,8 @@ ShowKnownLocationsFrame = function()
         local chosen = ui.visibleEntries[ui.selectedIndex]
         if DeleteKnownLocationEntry(chosen) then
             ui.selectedIndex = nil
+            ui.lastClickKey = nil
+            ui.lastClickTime = nil
             RefreshKnownLocationsFrame()
         end
     end)
@@ -2542,8 +3246,12 @@ ShowKnownLocationsFrame = function()
         importBtn = importBtn,
         searchBox = searchBox,
         instanceCheck = instanceCheck,
+        routesCheck = routesCheck,
+        transportsCheck = transportsCheck,
         searchText = "",
         instancesOnly = false,
+        routesOnly = false,
+        transportsOnly = false,
         selectedIndex = nil,
         visibleEntries = {},
     }
@@ -2905,9 +3613,6 @@ function CustomWaypoints_ToggleKnownLocations()
 end
 
 function CustomWaypoints_SaveHere()
-    if STATE.db.autoAdvance then
-        SlashHandler("autoadvance")
-    end
     AddCurrentLocationWithMetadataPopup()
 end
 
@@ -3079,13 +3784,7 @@ local function EnsureUi()
     importBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 258, -98)
     importBtn:SetText("Import")
     importBtn:SetScript("OnClick", function()
-        local box = STATE.ui and STATE.ui.importBox
-        if box then
-            box:ClearFocus()
-        end
-        local raw = box and box:GetText()
-        ImportWaypointsFromText(raw ~= nil and tostring(raw) or "")
-        RefreshUiHeader()
+        ShowWaypointImportPopup()
     end)
 
     local manageBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
@@ -3142,29 +3841,8 @@ local function EnsureUi()
     commands:SetJustifyH("LEFT")
     commands:SetText("\n/cw help | ui | tuning | options | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | autodiscovery | transportconfirmation | managetransports | knownlocations | routeknown <index> | saveroute | savehere")
 
-    local importLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    importLabel:SetPoint("TOPLEFT", commands, "BOTTOMLEFT", 0, -6)
-    importLabel:SetText("Import — paste lines from export (markers optional), then click Import:")
-
-    local importBox = CreateFrame("EditBox", "CustomWaypointsImportBox", f)
-    importBox:SetMultiLine(true)
-    importBox:SetPoint("TOPLEFT", importLabel, "BOTTOMLEFT", 0, -4)
-    importBox:SetSize(686, 86)
-    importBox:SetFontObject(GameFontHighlightSmall)
-    importBox:SetAutoFocus(false)
-    importBox:EnableMouse(true)
-    -- if importBox.EnableKeyboard then importBox:EnableKeyboard(true) end
-    importBox:SetTextInsets(4, 4, 4, 4)
-    importBox:SetJustifyH("LEFT")
-    if importBox.SetMaxLetters then importBox:SetMaxLetters(16384) end
-    importBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    local ibg = importBox:CreateTexture(nil, "BACKGROUND")
-    ibg:SetTexture(0.08, 0.08, 0.1, 0.9)
-    ibg:SetPoint("TOPLEFT", -3, 3)
-    ibg:SetPoint("BOTTOMRIGHT", 3, -3)
-
     local scroll = CreateFrame("ScrollFrame", "CustomWaypointsScrollFrame", f, "UIPanelScrollFrameTemplate")
-    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -266)
+    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -250)
     scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -32, 12)
 
     local output = CreateFrame("EditBox", "CustomWaypointsScrollChild", scroll)
@@ -3199,7 +3877,6 @@ local function EnsureUi()
         scroll = scroll,
         output = output,
         commands = commands,
-        importBox = importBox,
         checks = checks,
     }
 
@@ -3247,7 +3924,7 @@ local function EnsureInterfaceOptionsPanel()
 
     local checks = {}
     checks.autosync = MakePanelCheckbox("Auto sync to Carbonite", 16, -70, function() SlashHandler("autosync") end)
-    checks.autoadvance = MakePanelCheckbox("Auto advance on reach (recording/debugging)", 16, -100, function() SlashHandler("autoadvance") end)
+    checks.autoadvance = MakePanelCheckbox("Auto advance on reach (false for recording/debugging)", 16, -100, function() SlashHandler("autoadvance") end)
     checks.flying = MakePanelCheckbox("Micro routing", 16, -130, function() SlashHandler("hasflying") end)
     checks.flightmasters = MakePanelCheckbox("Use flight masters in deep mode", 16, -160, function() SlashHandler("flightmasters") end)
     checks.deep = MakePanelCheckbox("Deep routing mode", 16, -190, function(self)
@@ -3273,14 +3950,6 @@ local function EnsureInterfaceOptionsPanel()
     tuningBtn:SetScript("OnClick", function()
         ToggleRoutingTuningUi()
     end)
-
-    local note = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    note:SetPoint("TOPLEFT", openBtn, "BOTTOMLEFT", 0, -12)
-    note:SetWidth(500)
-    note:SetJustifyH("LEFT")
-    note:SetJustifyV("TOP")
-    if note.SetNonSpaceWrap then note:SetNonSpaceWrap(true) end
-    note:SetText("This panel controls CustomWaypoints planning, sync, \ndeep/minimal routing, flight-master usage, and flying-mount behavior.")
 
     InterfaceOptions_AddCategory(panel)
     STATE.interfacePanel = panel
@@ -3481,6 +4150,11 @@ function ClearPendingDeathAutoRoute()
     STATE.pendingDeathAutoRoute = nil
 end
 
+local function ResetDeathAutoRouteCycle()
+    STATE.lastDeathAutoRouteKey = nil
+    STATE.pendingDeathAutoRoute = nil
+end
+
 function StartPendingDeathAutoRoute(delay)
     EnsureDb()
     if not (STATE.db and STATE.db.autoRouteSavedInstanceOnDeath) then return end
@@ -3497,7 +4171,6 @@ end
 
 local function GetPlayerWorldPos()
     local map = GetMap()
-    if not map then return nil end
 
     local inInstance, instanceType = false, "none"
     if IsInInstance then
@@ -3509,29 +4182,40 @@ local function GetPlayerWorldPos()
     local zoneText = GetRealZoneText and GetRealZoneText() or nil
     local subZoneText = GetSubZoneText and GetSubZoneText() or nil
 
-    -- Prefer explicit instance state first. Some entrances/dungeons can still
-    -- produce a normal zone-map result via SetMapToCurrentZone(), which hides
-    -- the fact that we are now inside an instance and prevents portal/instance
-    -- discovery from firing.
-    if inInstance and map.GCMI then
-        local maI = map:GCMI()
-        if maI and maI > 0 then
-            return {
-                maI = maI,
-                wx = nil,
-                wy = nil,
-                zx = nil,
-                zy = nil,
-                mapName = (zoneText and zoneText ~= "" and zoneText) or (map.ITN and map:ITN(maI)) or ("Map " .. tostring(maI)),
-                instance = true,
-                instanceType = instanceType,
-                zoneText = zoneText,
-                subZoneText = subZoneText,
-            }
+    -- Instance-position invariant:
+    -- keep real world coordinates for instances that expose them, but still
+    -- return a synthetic instance position for Stockade-style/manual entries
+    -- when Warmane/WotLK or Carbonite cannot provide usable world coordinates.
+    -- Do not require a Carbonite map object for strict instance detection.
+    local function BuildSyntheticInstancePos(maI)
+        local resolvedMaI = tonumber(maI)
+        if not resolvedMaI or resolvedMaI <= 0 then
+            resolvedMaI = -1
         end
+        local resolvedName = (zoneText and zoneText ~= "" and zoneText)
+            or (subZoneText and subZoneText ~= "" and subZoneText)
+            or (map and resolvedMaI > 0 and map.ITN and map:ITN(resolvedMaI))
+            or "Instance"
+        return {
+            maI = resolvedMaI,
+            wx = nil,
+            wy = nil,
+            zx = nil,
+            zy = nil,
+            mapName = resolvedName,
+            instance = true,
+            instanceType = instanceType,
+            zoneText = zoneText,
+            subZoneText = subZoneText,
+        }
     end
 
-    if Nx and Nx.Map and Nx.Map.CZ2I then
+    local explicitInstanceMaI = nil
+    if inInstance and map and map.GCMI then
+        explicitInstanceMaI = map:GCMI() or nil
+    end
+
+    if map and Nx and Nx.Map and Nx.Map.CZ2I then
         local oldCont = GetCurrentMapContinent and GetCurrentMapContinent() or nil
         local oldZone = GetCurrentMapZone and GetCurrentMapZone() or nil
 
@@ -3569,24 +4253,54 @@ local function GetPlayerWorldPos()
         end
     end
 
-    if inInstance and map.GCMI then
-        local maI = map:GCMI()
-        if maI and maI > 0 then
-            return {
-                maI = maI,
-                wx = nil,
-                wy = nil,
-                zx = nil,
-                zy = nil,
-                mapName = (zoneText and zoneText ~= "" and zoneText) or (map.ITN and map:ITN(maI)) or ("Map " .. tostring(maI)),
-                instance = true,
-                instanceType = instanceType,
-                zoneText = zoneText,
-                subZoneText = subZoneText,
-            }
-        end
+    if inInstance then
+        return BuildSyntheticInstancePos(explicitInstanceMaI)
     end
 
+    return nil
+end
+
+local function ClonePersistentInstanceContext(pt)
+    if not pt then return nil end
+    local copy = CloneWorldPoint(pt) or {}
+    copy.instance = true
+    copy.instanceType = copy.instanceType or "instance"
+    return copy
+end
+
+local function RememberPersistentInstanceContext(pt)
+    EnsureDb()
+    if not (STATE.db and pt and pt.instance) then return end
+    STATE.db.lastInstanceContext = ClonePersistentInstanceContext(pt)
+end
+
+local function RememberCorpseInstanceContext(pt)
+    EnsureDb()
+    if not (STATE.db and pt and pt.instance) then return end
+    STATE.db.corpseInstanceContext = ClonePersistentInstanceContext(pt)
+end
+
+local function ClearCorpseInstanceContext()
+    EnsureDb()
+    if STATE.db then
+        STATE.db.corpseInstanceContext = nil
+    end
+end
+
+local function GetBestInstanceContextForDeathRouting()
+    local pos = GetPlayerWorldPos()
+    if pos and pos.instance then
+        return pos
+    end
+    if STATE.lastInstanceStablePlayerPos and STATE.lastInstanceStablePlayerPos.instance then
+        return STATE.lastInstanceStablePlayerPos
+    end
+    if STATE.db and STATE.db.corpseInstanceContext and STATE.db.corpseInstanceContext.instance then
+        return STATE.db.corpseInstanceContext
+    end
+    if STATE.db and STATE.db.lastInstanceContext and STATE.db.lastInstanceContext.instance then
+        return STATE.db.lastInstanceContext
+    end
     return nil
 end
 
@@ -3594,13 +4308,9 @@ function TryAutoRouteSavedInstanceOnDeath()
     EnsureDb()
     if not (STATE.db and STATE.db.autoRouteSavedInstanceOnDeath) then return false, "disabled" end
 
-    local pos = GetPlayerWorldPos()
+    local pos = GetBestInstanceContextForDeathRouting()
     if not pos then
-        return false, "no-position-yet"
-    end
-
-    if not pos.instance then
-        return false, "not-in-instance-yet"
+        return false, "no-instance-context-yet"
     end
 
     local loc = FindBestSavedInstanceForDeath(pos)
@@ -3623,6 +4333,15 @@ end
 
 function PulsePendingDeathAutoRoute()
     local pending = STATE.pendingDeathAutoRoute
+
+    if not pending then
+        local deadOrGhost = UnitIsDeadOrGhost and UnitIsDeadOrGhost("player")
+        if deadOrGhost and STATE.db and (STATE.db.corpseInstanceContext or STATE.db.lastInstanceContext) then
+            StartPendingDeathAutoRoute(0.15)
+            pending = STATE.pendingDeathAutoRoute
+        end
+    end
+
     if not pending then return end
 
     local now = GetTime and GetTime() or 0
@@ -3824,6 +4543,10 @@ local function BeginPendingTransport(reason, fromPos)
     local key = nil
     if keySeedTo then
         key = BuildTransportConfirmationKey(fromPos, keySeedTo)
+        if keySeedTo.instance and CW.IsRecentInstanceEntryDuplicate(fromPos, keySeedTo) then
+            dbg("pending transport suppressed: duplicate recent instance entry")
+            return
+        end
     end
 
     if key and STATE.activeConfirmationKey and STATE.activeConfirmationKey == key then
@@ -3849,16 +4572,25 @@ local function ShouldTreatAsTransportTransition(fromPos, toPos, reason)
         return false, "missing endpoints"
     end
 
-    if not fromPos.maI or not toPos.maI then
-        return false, "missing map ids"
+    -- Instance discovery invariant:
+    -- show the known-instance confirmation only on strict entry into an instance.
+    -- Teleports/leaves back to world space must never be treated as a discoverable
+    -- instance hop, even when PLAYER_ENTERING_WORLD fires during the transition.
+    -- Some Warmane/WotLK dungeons may not expose a usable Carbonite map id, so
+    -- strict instance entry must be recognized even without a normal toPos.maI.
+    if toPos.instance then
+        if not fromPos.instance then
+            return true, reason or "entered instance"
+        end
+        return false, "instance-to-instance transition"
     end
 
-    -- Important: instance entrances may not always produce a useful map-id change.
-    -- If we moved from non-instance world space into an instance, treat it as a
-    -- transport transition so the confirmation popup can appear and the entrance
-    -- can be saved as a known location.
-    if toPos.instance and not fromPos.instance then
-        return true, reason or "entered instance"
+    if fromPos.instance then
+        return false, "left instance"
+    end
+
+    if not fromPos.maI or not toPos.maI then
+        return false, "missing map ids"
     end
 
     if fromPos.maI == toPos.maI then
@@ -3878,12 +4610,55 @@ local function ShouldTreatAsTransportTransition(fromPos, toPos, reason)
     return true, reason or "map changed"
 end
 
+local function IsLikelyLfgTeleportIntoInstance(fromPos, toPos, reason)
+    if not (fromPos and toPos and toPos.instance and not fromPos.instance) then
+        return false
+    end
+
+    -- Only care about world -> instance transitions.
+    if reason ~= "PLAYER_ENTERING_WORLD" then
+        return false
+    end
+
+    -- Being in LFG mode alone must NOT suppress discovery.
+    -- Suppress only likely RDF/LFG teleports.
+    local lfgMode = nil
+    if GetLFGMode then
+        local ok, mode = pcall(GetLFGMode)
+        if ok then lfgMode = mode end
+    end
+
+    if not lfgMode or lfgMode == "" or lfgMode == "none" then
+        return false
+    end
+
+    -- If we have outdoor world coords and they jump very far on PLAYER_ENTERING_WORLD,
+    -- treat it as a likely teleport. Manual walking entry should not look like this.
+    if fromPos.wx and fromPos.wy and toPos.wx and toPos.wy then
+        local dx = fromPos.wx - toPos.wx
+        local dy = fromPos.wy - toPos.wy
+        local dist = (dx * dx + dy * dy) ^ 0.5
+        if dist > 2000 then
+            return true
+        end
+    end
+
+    -- Missing usable destination coords on an LFG PEW instance entry is also a strong hint
+    -- that this was a teleport sequence, not a walked portal crossing.
+    if not toPos.maI or not toPos.wx or not toPos.wy then
+        return true
+    end
+
+    return false
+end
+
 local function ShowTransportConfirmationFrame()
     if not STATE.pendingConfirmationTransport then return end
 
     if STATE.confirmationFrame and STATE.confirmationFrame:IsShown() then
         return
     end
+
 
     local f = CreateFrame("Frame", "CustomWaypointsTransportConfirmationFrame", UIParent)
     f:SetWidth(430)
@@ -3895,21 +4670,6 @@ local function ShowTransportConfirmationFrame()
     f:SetMovable(true)
     f:RegisterForDrag("LeftButton")
     if f.EnableKeyboard then f:EnableKeyboard(false) end
-    f:SetScript("OnKeyDown", function(self, key)
-        if key == "ESCAPE" then
-            local p2 = STATE.pendingConfirmationTransport
-            if p2 then
-                DismissConfirmationCandidate(p2.fromPos, p2.toPos, 30)
-                MarkConfirmationRecentlyHandled(p2.fromPos, p2.toPos, 30)
-                if p2.toPos and p2.toPos.instance and p2.toPos.maI then
-                    STATE.lastStablePlayerPos = CloneWorldPoint(p2.toPos)
-                end
-            end
-            STATE.pendingConfirmationTransport = nil
-            ClearPendingTransport()
-            self:Hide()
-        end
-    end)
     f:SetScript("OnDragStart", function(self) self:StartMoving() end)
     f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
 
@@ -3946,15 +4706,33 @@ local function ShowTransportConfirmationFrame()
     disableDiscovery:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 46)
     disableDiscovery:SetChecked(false)
 
-    local label = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    label:SetPoint("LEFT", disableDiscovery, "RIGHT", 2, 1)
-    label:SetText("Don't ask again (disable AutoDiscovery)")
-
     local function ApplyPopupToggle()
         if disableDiscovery:GetChecked() then
             SetAutoDiscoveryEnabled(false)
         end
     end
+
+    local function RejectTransportConfirmation(self)
+        local p2 = STATE.pendingConfirmationTransport
+        if p2 then
+            local suppressSeconds = (p2.toPos and p2.toPos.instance) and 3600 or 30
+            DismissConfirmationCandidate(p2.fromPos, p2.toPos, suppressSeconds)
+            MarkConfirmationRecentlyHandled(p2.fromPos, p2.toPos, suppressSeconds)
+            if p2.toPos and p2.toPos.instance and p2.toPos.maI then
+                STATE.lastStablePlayerPos = CloneWorldPoint(p2.toPos)
+            end
+        end
+
+        ApplyPopupToggle()
+        STATE.pendingConfirmationTransport = nil
+        ClearPendingTransport()
+        self:Hide()
+    end
+    f.cwEscAction = RejectTransportConfirmation
+
+    local label = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    label:SetPoint("LEFT", disableDiscovery, "RIGHT", 2, 1)
+    label:SetText("Don't ask again (disable AutoDiscovery)")
 
     local yesBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     yesBtn:SetWidth(80)
@@ -4016,23 +4794,7 @@ local function ShowTransportConfirmationFrame()
     noBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -20, 20)
     noBtn:SetText("No")
     noBtn:SetScript("OnClick", function()
-        local p2 = STATE.pendingConfirmationTransport
-        if p2 then
-            DismissConfirmationCandidate(p2.fromPos, p2.toPos, 30)
-            MarkConfirmationRecentlyHandled(p2.fromPos, p2.toPos, 30)
-            if p2.toPos and p2.toPos.instance and p2.toPos.maI then
-                STATE.lastStablePlayerPos = CloneWorldPoint(p2.toPos)
-            end
-        end
-        ApplyPopupToggle()
-        STATE.pendingConfirmationTransport = nil
-        ClearPendingTransport()
-        f:Hide()
-    end)
-
-    f:SetScript("OnHide", function(self)
-        if self.EnableKeyboard then self:EnableKeyboard(false) end
-        STATE.confirmationFrame = nil
+        RejectTransportConfirmation(f)
     end)
 
     if UISpecialFrames and not STATE.transportConfirmationSpecialRegistered then
@@ -4049,8 +4811,11 @@ local function ShowTransportConfirmationFrame()
     f:SetScript("OnHide", function(self)
         local p2 = STATE.pendingConfirmationTransport
         if p2 then
-            DismissConfirmationCandidate(p2.fromPos, p2.toPos, 12)
-            MarkConfirmationRecentlyHandled(p2.fromPos, p2.toPos, 12)
+            -- Instance / zone transitions can briefly hide this popup while the
+            -- entry sequence is still settling. Do not mark it as fully handled here,
+            -- otherwise later zone events suppress the real confirmation too
+            -- aggressively. Use only a short dismiss window to absorb immediate spam.
+            DismissConfirmationCandidate(p2.fromPos, p2.toPos, p2.toPos and p2.toPos.instance and 2 or 6)
             STATE.pendingConfirmationTransport = nil
         end
         RemoveCwModalFrame(self)
@@ -4060,12 +4825,23 @@ local function ShowTransportConfirmationFrame()
     end)
 
     STATE.confirmationFrame = f
+    ArmKeyboardModalFrame(f)
     f:Show()
 end
 
 local function RequestLearnedTransportConfirmation(fromPos, toPos, reason)
     if not fromPos or not toPos then return end
     EnsureDb()
+
+    if IsLikelyLfgTeleportIntoInstance(fromPos, toPos, reason) then
+        dbg("confirmation suppressed: likely LFG teleport into instance")
+        return
+    end
+
+    if toPos.instance and CW.IsRecentInstanceEntryDuplicate(fromPos, toPos) and reason == "implicit-map-change" then
+        dbg("confirmation suppressed: duplicate implicit instance entry")
+        return
+    end
 
     if not IsAutoDiscoveryEnabled() then
         dbg("autodiscovery disabled: skipped transport discovery")
@@ -4207,7 +4983,10 @@ local function PulseTransportDiscovery(elapsed)
             if (STATE.pendingTransport.wait or 0) <= 0 then
                 local shouldLearn, why = ShouldTreatAsTransportTransition(STATE.pendingTransport.from, current, STATE.pendingTransport.reason)
                 if shouldLearn then
-                    RequestLearnedTransportConfirmation(STATE.pendingTransport.from, current, STATE.pendingTransport.reason)
+                    if current.instance then
+                    CW.RememberRecentInstanceEntry(STATE.pendingTransport.from, current, 4)
+                end
+                RequestLearnedTransportConfirmation(STATE.pendingTransport.from, current, STATE.pendingTransport.reason)
                 else
                     dbg("ignored map hop: " .. tostring(why) .. " from=" .. tostring(STATE.pendingTransport.from.mapName) .. " to=" .. tostring(current.mapName))
                 end
@@ -4229,25 +5008,51 @@ local function PulseTransportDiscovery(elapsed)
     end
 
     if current then
-        if STATE.lastStablePlayerPos and current.maI ~= STATE.lastStablePlayerPos.maI and not STATE.pendingTransport then
-            BeginPendingTransport("implicit-map-change", STATE.lastStablePlayerPos)
-            if STATE.pendingTransport then
-                STATE.pendingTransport.wait = 0.1
-                STATE.pendingTransport.seenDifferentMap = true
+        local implicitFrom = STATE.lastStablePlayerPos
+        if current.instance and implicitFrom and implicitFrom.instance and STATE.lastNonInstanceStablePlayerPos then
+            implicitFrom = STATE.lastNonInstanceStablePlayerPos
+        end
 
-                if current and current.maI ~= STATE.pendingTransport.from.maI then
-                    local shouldLearn, why = ShouldTreatAsTransportTransition(STATE.pendingTransport.from, current, STATE.pendingTransport.reason)
-                    if shouldLearn then
-                        RequestLearnedTransportConfirmation(STATE.pendingTransport.from, current, STATE.pendingTransport.reason)
-                    else
-                        dbg("ignored implicit map hop: " .. tostring(why) .. " from=" .. tostring(STATE.pendingTransport.from.mapName) .. " to=" .. tostring(current.mapName))
+        local implicitMapChanged = implicitFrom and current.maI ~= implicitFrom.maI
+        local implicitEnteredInstance = implicitFrom and current.instance and not implicitFrom.instance
+
+        -- Warmane/WotLK invariant:
+        -- some manual dungeon entries (for example Stockade-style entrances) may
+        -- not expose a distinct Carbonite map id, so the implicit fallback must
+        -- also react to a strict world -> instance state change.
+        -- Keep the last non-instance position around so late zone events still
+        -- compare against the outdoor entrance instead of a synthetic instance pos.
+        if implicitFrom and not STATE.pendingTransport and (implicitMapChanged or implicitEnteredInstance) then
+            if current and current.instance and CW.IsRecentInstanceEntryDuplicate(implicitFrom, current) then
+                dbg("implicit map-change suppressed: duplicate recent instance entry")
+            else
+                BeginPendingTransport("implicit-map-change", implicitFrom)
+                if STATE.pendingTransport then
+                    STATE.pendingTransport.wait = 0.1
+                    STATE.pendingTransport.seenDifferentMap = true
+
+                    if current and (current.maI ~= STATE.pendingTransport.from.maI or (current.instance and not STATE.pendingTransport.from.instance)) then
+                        local shouldLearn, why = ShouldTreatAsTransportTransition(STATE.pendingTransport.from, current, STATE.pendingTransport.reason)
+                        if shouldLearn then
+                            if current.instance then
+                                CW.RememberRecentInstanceEntry(STATE.pendingTransport.from, current, 4)
+                            end
+                            RequestLearnedTransportConfirmation(STATE.pendingTransport.from, current, STATE.pendingTransport.reason)
+                        else
+                            dbg("ignored implicit map hop: " .. tostring(why) .. " from=" .. tostring(STATE.pendingTransport.from.mapName) .. " to=" .. tostring(current.mapName))
+                        end
+                        ClearPendingTransport()
                     end
-                    ClearPendingTransport()
                 end
             end
         end
         if current and (current.maI or (current.wx and current.wy)) then
             STATE.lastStablePlayerPos = CloneWorldPoint(current)
+            if current.instance then
+                STATE.lastInstanceStablePlayerPos = CloneWorldPoint(current)
+            else
+                STATE.lastNonInstanceStablePlayerPos = CloneWorldPoint(current)
+            end
         end
     end
 end
@@ -4602,6 +5407,7 @@ local function BuildKnownTaxiNodes(map)
     local function pushTaxiAny(taxiName, npcName, maI, wx, wy)
         local key = NormalizeTaxiKey(taxiName)
         if not key or seen[key] then return end
+        if not knownLookup[key] then return end
         if not (maI and wx and wy) then return end
         local ok, zx, zy = pcall(map.GZP, map, maI, wx, wy)
         if not (ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100) then return end
@@ -4784,20 +5590,18 @@ local function EnsureGraph()
         local anyTaxiKnown = next(taxiKnown) and true or false
         for i = 1, #taxiNodeIds do
             local a = taxiNodeIds[i]
-            for j = 1, #taxiNodeIds do
-                if i ~= j then
-                    local b = taxiNodeIds[j]
-                    if anyTaxiKnown then
-                        local ka = NormalizeTaxiKey(a.taxiName)
-                        local kb = NormalizeTaxiKey(b.taxiName)
-                        if not (ka and kb and (taxiKnown[ka] or taxiKnown[kb])) then
-                            -- skip TFCT: avoids O(n^2) UI hitch; edges still added when one end is known
-                        else
-                            local ok, directCost = pcall(Nx.Tra.TFCT, Nx.Tra, a.taxiName, b.taxiName)
-                            if ok and directCost and directCost > 0 then
-                                addEdge(a.id, b.id, directCost, "taxi", format("Flight Master: %s -> %s", tostring(a.taxiName), tostring(b.taxiName)), false)
-                                graph.links[#graph.links + 1] = {a = a.id, b = b.id, type = "taxi"}
-                            end
+            for j = i + 1, #taxiNodeIds do
+                local b = taxiNodeIds[j]
+                if anyTaxiKnown then
+                    local ka = NormalizeTaxiKey(a.taxiName)
+                    local kb = NormalizeTaxiKey(b.taxiName)
+                    if not (ka and kb and (taxiKnown[ka] or taxiKnown[kb])) then
+                        -- skip TFCT: avoids O(n^2) UI hitch; edges still added when one end is known
+                    else
+                        local ok, directCost = pcall(Nx.Tra.TFCT, Nx.Tra, a.taxiName, b.taxiName)
+                        if ok and directCost and directCost > 0 then
+                            addEdge(a.id, b.id, directCost, "taxi", format("Flight Master: %s -> %s", tostring(a.taxiName), tostring(b.taxiName)), true)
+                            graph.links[#graph.links + 1] = {a = a.id, b = b.id, type = "taxi"}
                         end
                     end
                 end
@@ -5015,6 +5819,60 @@ local function FindBestPathWithOptionalLearnedPrefix(nodes, startId, goalId, sta
     return bestPath, bestCame, bestCost, bestEx
 end
 
+local function CollapseDeepTaxiChains(points)
+    if type(points) ~= "table" or #points <= 2 then
+        return points
+    end
+
+    local out = {}
+    local i = 1
+
+    local function ClonePoint(pt)
+        local copy = {}
+        for k, v in pairs(pt or {}) do
+            copy[k] = v
+        end
+        return copy
+    end
+
+    while i <= #points do
+        local pt = points[i]
+
+        if pt and pt.edgeType == "taxi" then
+            local chainStart = i
+            local chainEnd = i
+            local totalTaxiCost = tonumber(pt.cost) or 0
+
+            while chainEnd + 1 <= #points and points[chainEnd + 1] and points[chainEnd + 1].edgeType == "taxi" do
+                chainEnd = chainEnd + 1
+                totalTaxiCost = totalTaxiCost + (tonumber(points[chainEnd].cost) or 0)
+            end
+
+            if chainEnd > chainStart then
+                local lastTaxiPoint = points[chainEnd]
+                local collapsed = ClonePoint(lastTaxiPoint)
+
+                collapsed.cost = totalTaxiCost
+
+                local fromName = pt.mapName or pt.label or tostring(pt.maI or "?")
+                local toName = lastTaxiPoint.mapName or lastTaxiPoint.label or tostring(lastTaxiPoint.maI or "?")
+                collapsed.label = "Flight Master: " .. tostring(fromName) .. " -> " .. tostring(toName)
+
+                out[#out + 1] = collapsed
+            else
+                out[#out + 1] = ClonePoint(pt)
+            end
+
+            i = chainEnd + 1
+        else
+            out[#out + 1] = ClonePoint(pt)
+            i = i + 1
+        end
+    end
+
+    return out
+end
+
 local function BuildTransportLeg(startPoint, destPoint)
     local baseGraph, why = EnsureGraph()
     if not baseGraph then
@@ -5095,7 +5953,12 @@ local function BuildTransportLeg(startPoint, destPoint)
 
         local sameMap = {}
         for id, n in pairs(nodes) do
-            if type(id) == "number" and id ~= queryId and n.maI == preferMapId then
+            if type(id) == "number"
+                and id ~= queryId
+                and n.maI == preferMapId
+                and n.type ~= "start"
+                and n.type ~= "goal" then
+
                 local raw = WalkCostSeconds(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy)
                 local yards = WorldToYards(Dist(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy))
                 local pe, te = countPortalTaxi(n)
@@ -5120,7 +5983,12 @@ local function BuildTransportLeg(startPoint, destPoint)
         -- fall back to same-continent candidates so portal/taxi legs can still connect.
         if #sameMap == 0 and preferContinent then
             for id, n in pairs(nodes) do
-                if type(id) == "number" and id ~= queryId and n.continent == preferContinent then
+                if type(id) == "number"
+                    and id ~= queryId
+                    and n.continent == preferContinent
+                    and n.type ~= "start"
+                    and n.type ~= "goal" then
+
                     local raw = WalkCostSeconds(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy)
                     local yards = WorldToYards(Dist(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy))
                     local pe, te = countPortalTaxi(n)
@@ -5224,6 +6092,8 @@ local function BuildTransportLeg(startPoint, destPoint)
 
     if STATE.db and STATE.db.simplifyTransitWaypoints then
         route.points = CollapseMinimalTransitNoise(route.points)
+    else
+        route.points = CollapseDeepTaxiChains(route.points)
     end
 
     return route
@@ -5613,11 +6483,6 @@ AddCurrentLocationWithMetadataPopup = function()
         return
     end
 
-    if not dest.wx or not dest.wy then
-        pr("savehere failed: current location has no world coordinates")
-        return
-    end
-
     ShowWaypointMetadataPopup({
         title = "Save current location as waypoint",
         defaultName = BuildDefaultWaypointName(dest),
@@ -5632,6 +6497,9 @@ AddCurrentLocationWithMetadataPopup = function()
             dest.description = meta.description ~= "" and meta.description or nil
             dest.ts = date("%Y-%m-%d %H:%M:%S")
             tinsert(STATE.db.destinations, dest)
+            if STATE.db.autoAdvance then
+                SlashHandler("autoadvance")
+            end
             HandleQueueBecameNonEmpty("add-current-location-waypoint", wasEmpty)
             InvalidateRoute("current location waypoint added")
             RefreshUiHeader()
@@ -5954,6 +6822,7 @@ ImportWaypointsFromText = function(text)
     EnsureDb()
     if not STATE.db then return end
     text = gsub(tostring(text or ""), "\0", "")
+    text = UnescapeFromDisplay(text)
     text = StripLeadingBomAndBidi(text)
     if text:match("^%s*$") then
         pr("import: paste text from /cw export into the Import box (or /cw import <one line>).")
@@ -6006,21 +6875,6 @@ ImportWaypointsFromText = function(text)
         pr(format("import: loaded %d waypoint(s), skipped %d bad line(s)", #parsed, bad))
     else
         pr(format("import: loaded %d waypoint(s)", #parsed))
-    end
-end
-
-local function EnsurePopupEsc(frameName)
-    if UISpecialFrames then
-        local exists = false
-        for _, v in ipairs(UISpecialFrames) do
-            if v == frameName then
-                exists = true
-                break
-            end
-        end
-        if not exists then
-            tinsert(UISpecialFrames, frameName)
-        end
     end
 end
 
@@ -6166,11 +7020,32 @@ ShowWaypointMetadataPopup = function(opts)
     if f.EnableKeyboard then f:EnableKeyboard(false) end
     f:SetScript("OnDragStart", function(self) self:StartMoving() end)
     f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
-    f:SetScript("OnKeyDown", function(self, key)
-        if key == "ESCAPE" then
-            self:Hide()
+    f:SetScript('OnShow', function(self)
+        PushCwModalFrame(self)
+        if STATE.ui and STATE.ui.frame and self.SetFrameLevel then
+            local baseLevel = (STATE.ui.frame.GetFrameLevel and STATE.ui.frame:GetFrameLevel()) or 1
+            self:SetFrameLevel(baseLevel + 30)
+        end
+        if self.EnableKeyboard then
+            pcall(function() self:EnableKeyboard(false) end)
+        end
+        if self.SetPropagateKeyboardInput then
+            pcall(function() self:SetPropagateKeyboardInput(true) end)
         end
     end)
+    f:SetScript('OnHide', function(self)
+        RemoveCwModalFrame(self)
+        if self.SetPropagateKeyboardInput then
+            pcall(function() self:SetPropagateKeyboardInput(true) end)
+        end
+        if self.EnableKeyboard then
+            pcall(function() self:EnableKeyboard(false) end)
+        end
+    end)
+    f:SetScript('OnMouseDown', function(self)
+        PushCwModalFrame(self)
+    end)
+
 
     local bg = f:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints(f)
@@ -6178,8 +7053,8 @@ ShowWaypointMetadataPopup = function(opts)
 
     if f.SetBackdrop then
         f:SetBackdrop({
-            bgFile = "Interface\DialogFrame\UI-DialogBox-Background",
-            edgeFile = "Interface\Tooltips\UI-Tooltip-Border",
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
             tile = true, tileSize = 16, edgeSize = 16,
             insets = { left = 4, right = 4, top = 4, bottom = 4 }
         })
@@ -6199,6 +7074,9 @@ ShowWaypointMetadataPopup = function(opts)
     nameBox:SetHeight(20)
     nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
     nameBox:SetText(opts.defaultName or "")
+    nameBox:SetScript("OnEnterPressed", function()
+        CommitWaypointMetadataPopup()
+    end)
 
     local labelLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     labelLabel:SetPoint("TOPLEFT", nameLabel, "BOTTOMLEFT", 0, -22)
@@ -6210,6 +7088,9 @@ ShowWaypointMetadataPopup = function(opts)
     labelBox:SetHeight(20)
     labelBox:SetPoint("LEFT", labelLabel, "RIGHT", 10, 0)
     labelBox:SetText(opts.defaultLabel or "")
+    labelBox:SetScript("OnEnterPressed", function()
+        CommitWaypointMetadataPopup()
+    end)
 
     local descLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     descLabel:SetPoint("TOPLEFT", labelLabel, "BOTTOMLEFT", 0, -22)
@@ -6227,6 +7108,9 @@ ShowWaypointMetadataPopup = function(opts)
     descBox:SetText(opts.defaultDescription or "")
     if descBox.EnableKeyboard then descBox:EnableKeyboard(true) end
     descBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    descBox:SetScript("OnEnterPressed", function(self)
+        CommitWaypointMetadataPopup()
+    end)
 
     local descBg = descBox:CreateTexture(nil, "BACKGROUND")
     descBg:SetTexture(0.08, 0.08, 0.1, 0.9)
@@ -6250,18 +7134,29 @@ ShowWaypointMetadataPopup = function(opts)
     close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
     close:SetScript("OnClick", function() f:Hide() end)
 
-    saveBtn:SetScript("OnClick", function()
+    CommitWaypointMetadataPopup = function()
         local payload = {
             name = (nameBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", ""),
             label = (labelBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", ""),
             description = descBox:GetText() or "",
         }
+
         local current = STATE.waypointMetadataPopup
+        local point = GetPlayerWorldPos()
+        local titleText = current.title:GetText() or ""
+        if ((not point) or point.wx == nil or point.wy == nil) and string.find(titleText, "waypoint", 1, true)
+        then
+            pr("save failed: current point has no world coordinates")
+            return
+        end
+
         if current and current.onSave then
             current.onSave(payload)
         end
         f:Hide()
-    end)
+    end
+
+    saveBtn:SetScript("OnClick", CommitWaypointMetadataPopup)
 
     f:SetScript("OnHide", function(self)
         if nameBox and nameBox.ClearFocus then nameBox:ClearFocus() end
@@ -6270,8 +7165,7 @@ ShowWaypointMetadataPopup = function(opts)
         if self.EnableKeyboard then self:EnableKeyboard(false) end
     end)
 
-    EnsurePopupEsc(frameName)
-
+    ArmKeyboardModalFrame(f)
     STATE.waypointMetadataPopup = {
         frame = f,
         title = title,
@@ -6419,7 +7313,7 @@ local function RouteSummary()
     end
 end
 
-local function GraphSummary()
+GraphSummary = function()
     local graph, why = EnsureGraph()
     if not graph then
         pr("graph build failed: " .. tostring(why))
@@ -6430,30 +7324,112 @@ local function GraphSummary()
 end
 
 EnsureCarboniteMapButtons = function()
-    if STATE.mapSaveRouteButton then return end
     local map = GetMap()
     if not map or not map.Frm then return end
 
-    local b = CreateFrame("Button", "CWPhase5BSaveRouteMapButton", map.Frm, "UIPanelButtonTemplate")
-    b:SetWidth(88)
-    b:SetHeight(20)
-    b:SetPoint("BOTTOMRIGHT", map.Frm, "BOTTOMRIGHT", -5, 25)
-    b:SetText("Save Route")
-    b:SetFrameStrata("DIALOG")
-    b:SetScript("OnClick", function()
-        SaveQueueAsKnownRoute()
-    end)
+    local parent = map.Frm
+    local b = STATE.mapSaveRouteButton
 
-    STATE.mapSaveRouteButton = b
+    if not b or (b.IsObjectType and not b:IsObjectType("Button")) then
+        b = CreateFrame("Button", "CWPhase5BSaveRouteMapButton", parent, "UIPanelButtonTemplate")
+        b:SetWidth(88)
+        b:SetHeight(20)
+        b:SetText("Save Route")
+        b:SetFrameStrata("DIALOG")
+        b:SetScript("OnClick", function()
+            SaveQueueAsKnownRoute()
+        end)
+        STATE.mapSaveRouteButton = b
+    end
+
+    if b.GetParent and b:GetParent() ~= parent and b.SetParent then
+        b:SetParent(parent)
+    end
+
+    if b.ClearAllPoints then
+        b:ClearAllPoints()
+    end
+    b:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -5, 25)
+
+    if b.SetFrameStrata and parent.GetFrameStrata then
+        b:SetFrameStrata(parent:GetFrameStrata())
+    end
+    if b.SetFrameLevel and parent.GetFrameLevel then
+        b:SetFrameLevel((parent:GetFrameLevel() or 1) + 10)
+    end
+
+    if b.EnableMouse then
+        b:EnableMouse(true)
+    end
+    if b.Enable then
+        b:Enable()
+    end
+    if b.SetAlpha then
+        b:SetAlpha(1)
+    end
+    if b.Show then
+        b:Show()
+    end
+
+    if not STATE.mapSaveRouteButtonHooksInstalled then
+        local function RefreshMapSaveRouteButton()
+            if not STATE.mapSaveRouteButton then return end
+            local currentMap = GetMap()
+            if not currentMap or not currentMap.Frm then return end
+            local btn = STATE.mapSaveRouteButton
+            local currentParent = currentMap.Frm
+
+            if btn.GetParent and btn:GetParent() ~= currentParent and btn.SetParent then
+                btn:SetParent(currentParent)
+            end
+            if btn.ClearAllPoints then
+                btn:ClearAllPoints()
+            end
+            btn:SetPoint("BOTTOMRIGHT", currentParent, "BOTTOMRIGHT", -5, 25)
+
+            if btn.SetFrameStrata and currentParent.GetFrameStrata then
+                btn:SetFrameStrata(currentParent:GetFrameStrata())
+            end
+            if btn.SetFrameLevel and currentParent.GetFrameLevel then
+                btn:SetFrameLevel((currentParent:GetFrameLevel() or 1) + 10)
+            end
+
+            if btn.EnableMouse then btn:EnableMouse(true) end
+            if btn.Enable then btn:Enable() end
+            if btn.SetAlpha then btn:SetAlpha(1) end
+            if currentParent.IsShown and currentParent:IsShown() then
+                btn:Show()
+            else
+                btn:Hide()
+            end
+        end
+
+        parent:HookScript("OnShow", RefreshMapSaveRouteButton)
+        parent:HookScript("OnHide", function()
+            if STATE.mapSaveRouteButton and STATE.mapSaveRouteButton.Hide then
+                STATE.mapSaveRouteButton:Hide()
+            end
+        end)
+        parent:HookScript("OnSizeChanged", RefreshMapSaveRouteButton)
+
+        STATE.mapSaveRouteButtonHooksInstalled = true
+    end
 end
 
 local function HookMapClicks()
+    EnsureCarboniteMapButtons()
     if STATE.hookInstalled then return end
     local map = GetMap()
     if not map or not map.Frm then return end
 
     map.Frm:HookScript("OnMouseDown", function(_, button)
         if STATE.syncing then return end
+
+        if button == "RightButton" and STATE.mapSaveRouteButton and STATE.mapSaveRouteButton.Hide then
+            local btn = STATE.mapSaveRouteButton
+            btn:Hide()
+            STATE.mapSaveRouteButtonRestoreAt = (GetTime and GetTime() or 0) + 0.35
+        end
 
         local labeled = (button == "LeftButton" and IsShiftKeyDown() and IsControlKeyDown())
         local primary = (button == (STATE.db.bindingButton or "LeftButton") and IsModifierDown(STATE.db.bindingModifier or "SHIFT") and not IsControlKeyDown())
@@ -6464,6 +7440,37 @@ local function HookMapClicks()
         elseif primary or fallback then
             AddCurrentCursorWaypoint()
         end
+    end)
+
+    map.Frm:HookScript("OnUpdate", function()
+        local btn = STATE.mapSaveRouteButton
+        local restoreAt = STATE.mapSaveRouteButtonRestoreAt
+        if not (btn and restoreAt) then return end
+        local now = GetTime and GetTime() or 0
+        if now < restoreAt then return end
+        STATE.mapSaveRouteButtonRestoreAt = nil
+
+        local currentMap = GetMap()
+        local parent = currentMap and currentMap.Frm
+        if not (parent and parent.IsShown and parent:IsShown()) then return end
+
+        if btn.GetParent and btn:GetParent() ~= parent and btn.SetParent then
+            btn:SetParent(parent)
+        end
+        if btn.ClearAllPoints then
+            btn:ClearAllPoints()
+        end
+        btn:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -5, 25)
+        if btn.SetFrameStrata and parent.GetFrameStrata then
+            btn:SetFrameStrata(parent:GetFrameStrata())
+        end
+        if btn.SetFrameLevel and parent.GetFrameLevel then
+            btn:SetFrameLevel((parent:GetFrameLevel() or 1) + 10)
+        end
+        if btn.EnableMouse then btn:EnableMouse(true) end
+        if btn.Enable then btn:Enable() end
+        if btn.SetAlpha then btn:SetAlpha(1) end
+        if btn.Show then btn:Show() end
     end)
 
     STATE.hookInstalled = true
@@ -6550,14 +7557,8 @@ SlashHandler = function(msg)
         local payload = msg:match("^import%s+(.+)$")
         ImportWaypointsFromText(payload or "")
     elseif msg == "import" then
-        EnsureUi()
-        if STATE.ui and STATE.ui.frame then
-            STATE.ui.frame:Show()
-            if STATE.ui.importBox then
-                STATE.ui.importBox:SetFocus()
-            end
-        end
-        pr("import: paste export lines into the Import box, then click Import (or /cw import <single line>).")
+        ShowWaypointImportPopup()
+        pr("import: paste export lines into the waypoint import popup (or /cw import <single line>).")
     elseif msg == "sync" then
         SyncQueueToCarbonite()
     elseif msg == "route" then
@@ -6583,7 +7584,7 @@ SlashHandler = function(msg)
         STATE.db.autoAdvance = not STATE.db.autoAdvance
         pr("autoAdvance=" .. tostring(STATE.db.autoAdvance))
         RefreshUiHeader()
-    elseif msg == "hasflying" or msg == "toggleflying" or msg == "flymode" or "microrouting" then
+    elseif msg == "hasflying" or msg == "toggleflying" or msg == "flymode" or msg == "microrouting" then
         STATE.db.hasFlyingMount = not STATE.db.hasFlyingMount
         InvalidateRoute("hasFlyingMount toggled")
         pr("hasFlyingMount=" .. tostring(STATE.db.hasFlyingMount))
@@ -6653,13 +7654,13 @@ SlashHandler = function(msg)
     end
 end
 
-local function ScheduleLoginQueueSyncIfNeeded()
+ScheduleLoginQueueSyncIfNeeded = function()
     EnsureDb()
     if not STATE.db or #(STATE.db.destinations or {}) == 0 then return end
     STATE.needLoginQueueSync = true
 end
 
-local function TryPendingLoginQueueSync()
+TryPendingLoginQueueSync = function()
     if not STATE.needLoginQueueSync then return end
     EnsureDb()
     if not STATE.db or #(STATE.db.destinations or {}) == 0 then
@@ -6698,19 +7699,31 @@ local function OnEvent(_, event)
         EnsureInterfaceOptionsPanel()
         ScheduleLoginQueueSyncIfNeeded()
         EnsureCarboniteMapButtons()
-        if STATE.lastStablePlayerPos then
-            BeginPendingTransport("PLAYER_ENTERING_WORLD", STATE.lastStablePlayerPos)
+        local eventFrom = STATE.lastStablePlayerPos
+        local eventCurrent = GetPlayerWorldPos()
+        if eventCurrent and eventCurrent.instance and eventFrom and eventFrom.instance and STATE.lastNonInstanceStablePlayerPos then
+            eventFrom = STATE.lastNonInstanceStablePlayerPos
+        end
+        if eventFrom then
+            BeginPendingTransport("PLAYER_ENTERING_WORLD", eventFrom)
         end
     elseif event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" or event == "ZONE_CHANGED_INDOORS" then
         EnsureDb()
-        if STATE.lastStablePlayerPos then
-            BeginPendingTransport(event, STATE.lastStablePlayerPos)
+        local eventFrom = STATE.lastStablePlayerPos
+        local eventCurrent = GetPlayerWorldPos()
+        if eventCurrent and eventCurrent.instance and eventFrom and eventFrom.instance and STATE.lastNonInstanceStablePlayerPos then
+            eventFrom = STATE.lastNonInstanceStablePlayerPos
+        end
+        if eventFrom then
+            BeginPendingTransport(event, eventFrom)
         end
     elseif event == "PLAYER_DEAD" then
         EnsureDb()
+        ResetDeathAutoRouteCycle()
         StartPendingDeathAutoRoute(0.20)
     elseif event == "PLAYER_ALIVE" or event == "PLAYER_UNGHOST" then
         EnsureDb()
+        ResetDeathAutoRouteCycle()
         StartPendingDeathAutoRoute(0.35)
     elseif event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED" then
         RefreshCwEscOverride()

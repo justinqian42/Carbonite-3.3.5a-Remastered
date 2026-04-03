@@ -13,7 +13,8 @@ This repo bundles a **Wrath-era (3.3.5a)** Carbonite tree with **CustomWaypoints
 ## Trying CustomWaypoints
 
 1. Copy **`Carbonite`** and **`CustomWaypoints`** into `Interface\AddOns\`.
-2. In-game: **`/cw help`** — default capture is **Shift+left-click** on the Carbonite world map (Ctrl+right-click alternate).
+2. In-game: **`/cw help`** — default capture is **Shift+left-click** on the Carbonite world map.
+> ⚠️ Important: This functionality only works on the character’s current map (via the minimap). Use the world map to navigate between different zones.
 3. Maintenance / “what must not break” lives in **`CustomWaypoints/CHECKPOINT.md`**.
 
 ---
