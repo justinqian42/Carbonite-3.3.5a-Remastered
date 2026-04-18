@@ -1663,6 +1663,11 @@ local function FindBestPathWithOptionalLearnedPrefix(nodes, startId, goalId, sta
     return bestPath, bestCame, bestCost, bestEx
 end
 
+local function IsNearWorldPoint(wx1, wy1, wx2, wy2, maxYards)
+    local yards = WorldToYards(Dist(wx1, wy1, wx2, wy2))
+    return yards ~= huge and yards <= (maxYards or 80)
+end
+
 local function CollapseDeepTaxiChains(points)
     if type(points) ~= "table" or #points <= 2 then
         return points
@@ -1670,6 +1675,14 @@ local function CollapseDeepTaxiChains(points)
 
     local out = {}
     local i = 1
+    local maxConnectorCost = 35
+    local maxConnectorYards = 180
+    local compressibleConnectorTypes = {
+        ["walk-to-transport"] = true,
+        walk = true,
+        connector = true,
+        walklink = true,
+    }
 
     local function ClonePoint(pt)
         local copy = {}
@@ -1685,11 +1698,50 @@ local function CollapseDeepTaxiChains(points)
         return kind == "flight_master"
     end
 
+    local function GetFlightMasterChainStartName(pt)
+        if not pt then return nil end
+        local label = tostring(pt.label or "")
+        local fromName = match(label, "^Flight Master:%s*(.-)%s*%-%>")
+        if fromName and fromName ~= "" then
+            return fromName
+        end
+        return pt.mapName or tostring(pt.maI or "?")
+    end
+
+    local function GetFlightMasterChainEndName(pt)
+        if not pt then return nil end
+        local label = tostring(pt.label or "")
+        local toName = match(label, "%-%>%s*(.-)%s*$")
+        if toName and toName ~= "" then
+            return toName
+        end
+        return pt.mapName or tostring(pt.maI or "?")
+    end
+
     local function IsMinorFlightMasterConnector(pt)
         if not pt then return false end
         if pt.edgeType ~= "walk-to-transport" then return false end
         local cost = tonumber(pt.cost) or huge
         return cost <= 3
+    end
+
+    local function IsCompressibleFlightMasterConnector(prevFlightPt, connectorPt, nextFlightPt)
+        if not (prevFlightPt and connectorPt and nextFlightPt) then return false end
+        if not compressibleConnectorTypes[connectorPt.edgeType] then return false end
+        if not IsFlightMasterRoutePoint(nextFlightPt) then return false end
+        if prevFlightPt.maI ~= connectorPt.maI then return false end
+
+        local cost = tonumber(connectorPt.cost) or huge
+        if cost <= 0 then
+            return true
+        end
+        if cost <= 3 and IsMinorFlightMasterConnector(connectorPt) then
+            return true
+        end
+        if cost > maxConnectorCost then
+            return false
+        end
+        return IsNearWorldPoint(prevFlightPt.wx, prevFlightPt.wy, connectorPt.wx, connectorPt.wy, maxConnectorYards)
     end
 
     while i <= #points do
@@ -1700,6 +1752,7 @@ local function CollapseDeepTaxiChains(points)
             local chainEnd = i
             local totalTaxiCost = tonumber(pt.cost) or 0
             local lastFlightIndex = i
+            local collapsedConnector = false
 
             while chainEnd < #points do
                 local nextPt = points[chainEnd + 1]
@@ -1707,9 +1760,10 @@ local function CollapseDeepTaxiChains(points)
                     chainEnd = chainEnd + 1
                     lastFlightIndex = chainEnd
                     totalTaxiCost = totalTaxiCost + (tonumber(nextPt.cost) or 0)
-                elseif IsMinorFlightMasterConnector(nextPt) and chainEnd + 2 <= #points and IsFlightMasterRoutePoint(points[chainEnd + 2]) then
+                elseif chainEnd + 2 <= #points and IsCompressibleFlightMasterConnector(points[lastFlightIndex], nextPt, points[chainEnd + 2]) then
                     chainEnd = chainEnd + 1
                     totalTaxiCost = totalTaxiCost + (tonumber(nextPt.cost) or 0)
+                    collapsedConnector = true
                 else
                     break
                 end
@@ -1725,10 +1779,10 @@ local function CollapseDeepTaxiChains(points)
                 collapsed.cost = totalTaxiCost
                 collapsed.transportChainStart = chainStart
                 collapsed.transportChainEnd = lastFlightIndex
-                collapsed.collapsedMinorConnector = true
+                collapsed.collapsedMinorConnector = collapsedConnector
 
-                local fromName = firstTaxiPoint.label or firstTaxiPoint.mapName or tostring(firstTaxiPoint.maI or "?")
-                local toName = lastTaxiPoint.label or lastTaxiPoint.mapName or tostring(lastTaxiPoint.maI or "?")
+                local fromName = GetFlightMasterChainStartName(firstTaxiPoint)
+                local toName = GetFlightMasterChainEndName(lastTaxiPoint)
                 collapsed.label = "Flight Master: " .. tostring(fromName) .. " -> " .. tostring(toName)
 
                 out[#out + 1] = collapsed
@@ -6549,11 +6603,6 @@ function PulsePendingDeathAutoRoute()
     if (pending.attempts % 3) == 0 then
         dbg("death auto-route retry " .. tostring(pending.attempts) .. ": " .. tostring(why))
     end
-end
-
-local function IsNearWorldPoint(wx1, wy1, wx2, wy2, maxYards)
-    local yards = WorldToYards(Dist(wx1, wy1, wx2, wy2))
-    return yards ~= huge and yards <= (maxYards or 80)
 end
 
 function FindSimilarLearnedTransport(fromPos, toPos)
