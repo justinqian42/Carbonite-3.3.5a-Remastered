@@ -4989,7 +4989,7 @@ RefreshKnownLocationsFrame = function()
 
     for i, entry in ipairs(visibleEntries) do
         local row = CreateFrame("Button", nil, content)
-        row:SetSize(590, 42)
+        row:SetSize(730, 42)
         row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, yOffset)
         row:RegisterForClicks("LeftButtonUp")
         row:SetScript("OnClick", function()
@@ -5220,7 +5220,7 @@ ShowKnownLocationsFrame = function()
     end
 
     local f = CreateFrame("Frame", "CustomWaypointsKnownLocationsFrame", UIParent)
-    f:SetWidth(650)
+    f:SetWidth(800)
     f:SetHeight(390)
     f:SetPoint("CENTER", UIParent, "CENTER", 30, -10)
     f:SetFrameStrata("DIALOG")
