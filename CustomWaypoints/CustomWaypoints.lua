@@ -355,6 +355,70 @@ local function CloneTransportEdgeWithEndpoints(edge)
     return NormalizeTransportRecord(copy)
 end
 
+
+function CW.BuildManualTransportFromRoutePoints(routePoints, opts)
+    if type(routePoints) ~= "table" or #routePoints ~= 2 then
+        return nil, "need-exactly-2-points"
+    end
+
+    local first = routePoints[1]
+    local last = routePoints[#routePoints]
+    if not first or not last then
+        return nil, "missing-endpoints"
+    end
+    if not (first.maI and first.wx and first.wy and last.maI and last.wx and last.wy) then
+        return nil, "missing-endpoint-coords"
+    end
+
+    local fromZoneName = first.userName or first.userLabel or first.mapName
+    if first.subZoneText and first.subZoneText ~= "" then
+        fromZoneName = first.subZoneText
+    elseif first.zoneText and first.zoneText ~= "" then
+        fromZoneName = first.zoneText
+    end
+
+    local toZoneName = last.userName or last.userLabel or last.mapName
+    if last.subZoneText and last.subZoneText ~= "" then
+        toZoneName = last.subZoneText
+    elseif last.zoneText and last.zoneText ~= "" then
+        toZoneName = last.zoneText
+    end
+
+    local edge = {
+        fromMaI = first.maI,
+        fromMapName = first.mapName,
+        fromZx = first.zx,
+        fromZy = first.zy,
+        fromWx = first.wx,
+        fromWy = first.wy,
+        fromInstance = first.instance,
+        fromInstanceType = first.instanceType,
+        fromZoneName = fromZoneName,
+        fromZoneText = first.zoneText,
+        fromSubZoneText = first.subZoneText,
+
+        toMaI = last.maI,
+        toMapName = last.mapName,
+        toZx = last.zx,
+        toZy = last.zy,
+        toWx = last.wx,
+        toWy = last.wy,
+        toInstance = last.instance,
+        toInstanceType = last.instanceType,
+        toZoneName = toZoneName,
+        toZoneText = last.zoneText,
+        toSubZoneText = last.subZoneText,
+
+        label = opts and opts.label or nil,
+        description = opts and opts.description or nil,
+        transportKind = opts and opts.transportKind or "passage",
+        bidirectional = opts and opts.bidirectional == true or false,
+        discoveredBy = opts and opts.discoveredBy or "manual-saveroute",
+    }
+
+    return NormalizeTransportRecord(edge), nil
+end
+
 local function BuildTransportRecordKey(edge)
     if not edge or not edge.fromMaI or not edge.toMaI then return nil end
     edge = NormalizeTransportRecord(edge)
@@ -379,6 +443,88 @@ local function BuildTransportRecordKey(edge)
         if b < a then a = b end
     end
     return kind .. "|" .. a .. "|b=" .. tostring(IsBidirectionalTransportRecord(edge) and 1 or 0)
+end
+
+function CW.BuildTransportLookupAliases(edge)
+    local out, seen = {}, {}
+
+    local function add(value)
+        local key = CW.NormalizeZoneLookupKey(value)
+        if key ~= "" and not seen[key] then
+            seen[key] = true
+            out[#out + 1] = value
+        end
+    end
+
+    add(edge and edge.toSubZoneText)
+    add(edge and edge.toZoneText)
+    add(edge and edge.toZoneName)
+    add(edge and edge.toMapName)
+    add(edge and edge.label)
+
+    return out
+end
+
+function CW.TransportDestinationAliasMatches(edge, name)
+    local targetKey = CW.NormalizeZoneLookupKey(name)
+    if targetKey == "" then return false end
+
+    local function matches(value)
+        return CW.NormalizeZoneLookupKey(value) == targetKey
+    end
+
+    return matches(edge and edge.toSubZoneText)
+        or matches(edge and edge.toZoneText)
+        or matches(edge and edge.toZoneName)
+end
+
+function CW.BuildPointFromTransportEndpoint(edge, prefix, label)
+    if not edge then return nil end
+
+    local maI = edge[prefix .. "MaI"]
+    local wx = edge[prefix .. "Wx"]
+    local wy = edge[prefix .. "Wy"]
+    if not (maI and wx and wy) then return nil end
+
+    return {
+        maI = maI,
+        wx = wx,
+        wy = wy,
+        zx = edge[prefix .. "Zx"],
+        zy = edge[prefix .. "Zy"],
+        mapName = edge[prefix .. "MapName"],
+        zoneText = edge[prefix .. "ZoneText"],
+        subZoneText = edge[prefix .. "SubZoneText"],
+        instance = edge[prefix .. "Instance"],
+        instanceType = edge[prefix .. "InstanceType"],
+        label = label,
+        forceStraight = true,
+    }
+end
+
+function CW.ArePointsNearSameLocation(a, b)
+    if not (a and b and a.maI and b.maI) then return false end
+    if a.maI ~= b.maI then return false end
+
+    local ax, ay = tonumber(a.wx), tonumber(a.wy)
+    local bx, by = tonumber(b.wx), tonumber(b.wy)
+    if not (ax and ay and bx and by) then return false end
+
+    return math.abs(ax - bx) <= 0.0001 and math.abs(ay - by) <= 0.0001
+end
+
+function CW.DoesPlayerAlreadyMatchZoneName(name)
+    local wanted = CW.NormalizeZoneLookupKey(name)
+    if wanted == "" then return false end
+
+    local pos = GetPlayerWorldPos()
+    if not pos then return false end
+
+    local function matches(value)
+        return CW.NormalizeZoneLookupKey(value) == wanted
+    end
+
+    return matches(pos.subZoneText) or matches(pos.zoneText) or matches(pos.mapName)
 end
 
 local function InferStoredTransportKind(loc)
@@ -1056,6 +1202,8 @@ local function TransportLabel(edge)
     local prefix = "Learned transport"
     if kind == "portal" then
         prefix = "Learned Portal"
+    elseif kind == "passage" then
+        prefix = "Passage"
     elseif kind == "zeppelin" then
         prefix = "Zeppelin"
     elseif kind == "boat" then
@@ -1373,6 +1521,20 @@ local function FindPathAStar(nodes, startId, goalId)
     return nil, nil, nil, explored
 end
 
+local function GetMapContinentForMaI(maI)
+    if not (maI and Nx and Nx.Map and Nx.Map.CZ2I) then return nil end
+    for continent, zoneMap in pairs(Nx.Map.CZ2I) do
+        if type(zoneMap) == "table" then
+            for _, candidateMaI in pairs(zoneMap) do
+                if candidateMaI == maI then
+                    return continent
+                end
+            end
+        end
+    end
+    return nil
+end
+
 local function EnsureGraph()
     if STATE.graph then return STATE.graph end
 
@@ -1409,7 +1571,7 @@ local function EnsureGraph()
             wy = wy,
             label = label,
             type = nodeType,
-            continent = nil,
+            continent = GetMapContinentForMaI(maI),
             edges = {},
         }
         nodeIndex[key] = id
@@ -1856,6 +2018,7 @@ local function BuildTransportLeg(startPoint, destPoint)
             wy = pt.wy,
             label = label,
             type = nodeType,
+            continent = pt.continent or GetMapContinentForMaI(pt.maI),
             edges = {},
         }
         return nextId
@@ -1869,6 +2032,7 @@ local function BuildTransportLeg(startPoint, destPoint)
        local function attachQueryNode(queryId, preferMapId, preferContinent, outwardLabel)
         local isStart = outwardLabel == "walk-to-node"
         local isGoal = outwardLabel == "node-to-goal"
+        local allowContinentFallback = not isGoal
         local tuning = GetRoutingTuning()
 
         local function countPortalTaxi(node)
@@ -1915,9 +2079,13 @@ local function BuildTransportLeg(startPoint, destPoint)
             end
         end
 
-        -- If there are no nodes on the exact map (common for destination maps),
-        -- fall back to same-continent candidates so portal/taxi legs can still connect.
-        if #sameMap == 0 and preferContinent then
+        -- Same-continent fallback is only safe for the start side.
+        -- For the goal side, attaching to an arbitrary continent node when the
+        -- destination map has no real graph node creates bogus anchors (for
+        -- example Dalaran -> Underbelly without a learned transport/passsage).
+        -- In that case we want the caller to fall back to a direct destination
+        -- leg instead of inventing a transport-adjacent anchor.
+        if #sameMap == 0 and preferContinent and allowContinentFallback then
             for id, n in pairs(nodes) do
                 if type(id) == "number"
                     and id ~= queryId
@@ -3997,13 +4165,55 @@ SaveQueueAsKnownRoute = function()
         defaultDescription = "",
         extraCheckboxes = {
             { key = "flightMaster", label = "Flight Master", checked = false },
+            { key = "passage", label = "Transport", checked = false },
+            { key = "bidirectional", label = "Bidirectional", checked = false },
         },
         onSave = function(meta)
-            local key = "route|" .. tostring(time and time() or GetTime() or math.random(100000, 999999))
             local routePoints = CloneDestinations(STATE.db.destinations)
+            local isFlightMaster = meta.extraValues and meta.extraValues.flightMaster == true
+            local isTransport = meta.extraValues and meta.extraValues.passage == true
+            local isBidirectional = meta.extraValues and meta.extraValues.bidirectional == true
+
+            meta._cwSavedTransportName = nil
+            meta._cwSavedTransportOnly = nil
+
+            if isTransport or isFlightMaster then
+                if #routePoints ~= 2 then
+                    SafePr("save transport failed: use exactly 2 queue points (entry -> destination)")
+                    return
+                end
+
+                local learned = EnsureTransportDb()
+                local edge, why = CW.BuildManualTransportFromRoutePoints(routePoints, {
+                    label = meta.label ~= "" and meta.label or meta.name,
+                    description = meta.description ~= "" and meta.description or nil,
+                    transportKind = isFlightMaster and "flight_master" or "passage",
+                    bidirectional = isFlightMaster and true or isBidirectional,
+                    discoveredBy = "manual-saveroute",
+                })
+                if not edge then
+                    SafePr("save transport failed: " .. tostring(why))
+                    return
+                end
+
+                local dupKey = BuildTransportRecordKey(edge)
+                meta._cwSavedTransportName = tostring(meta.name ~= "" and meta.name or edge.label or dupKey)
+
+                for _, existing in ipairs(learned or {}) do
+                    if BuildTransportRecordKey(existing) == dupKey then
+                        meta._cwSavedTransportOnly = true
+                        break
+                    end
+                end
+
+                if not meta._cwSavedTransportOnly then
+                    learned[#learned + 1] = edge
+                end
+            end
+
+            local key = "route|" .. tostring(time and time() or GetTime() or math.random(100000, 999999))
             STATE.db.knownLocations = STATE.db.knownLocations or {}
 
-            local isFlightMaster = meta.extraValues and meta.extraValues.flightMaster == true
             local candidate = {
                 key = key,
                 kind = "route",
@@ -4013,18 +4223,31 @@ SaveQueueAsKnownRoute = function()
                 routePoints = routePoints,
                 destination = CloneDestination(routePoints[#routePoints]),
                 mapName = routePoints[#routePoints] and routePoints[#routePoints].mapName or nil,
-                transportKind = isFlightMaster and "flight_master" or "route",
-                bidirectional = isFlightMaster and true or false,
+                transportKind = (isFlightMaster and "flight_master") or (isTransport and "passage") or "route",
+                bidirectional = isFlightMaster and true or (isTransport and isBidirectional) or false,
                 discoveredBy = "manual-saveroute",
             }
 
             local duplicateIndex = FindDuplicateKnownLocationIndex(candidate)
             if duplicateIndex then
+                if meta._cwSavedTransportName then
+                    InvalidateRoute("saved manual transport")
+                    RefreshKnownLocationsFrame()
+                    SafePr("saved known transport only (route duplicate): " .. meta._cwSavedTransportName)
+                    return
+                end
                 SafePr("saved known route skipped: duplicate of existing known location #" .. tostring(duplicateIndex))
                 return
             end
 
             STATE.db.knownLocations[#STATE.db.knownLocations + 1] = candidate
+
+            if meta._cwSavedTransportName then
+                InvalidateRoute("saved manual transport + known route")
+                RefreshKnownLocationsFrame()
+                SafePr("saved known transport + route: " .. tostring(meta.name ~= "" and meta.name or key))
+                return
+            end
 
             SafePr("saved known route: " .. tostring(meta.name ~= "" and meta.name or key))
             RefreshKnownLocationsFrame()
@@ -5031,6 +5254,11 @@ local function ReleaseKnownLocationsSearchFocus()
     RefreshCwEscOverride()
 end
 
+local function GetDisplayNameForPoint(pt)
+    if not pt then return "?" end
+    return pt.userName or pt.zoneText or pt.subZoneText or pt.mapName or pt.maI or "?"
+end
+
 RefreshKnownLocationsFrame = function()
     if not (STATE.knownLocationsUi and STATE.knownLocationsUi.frame) then return end
 
@@ -5139,8 +5367,8 @@ RefreshKnownLocationsFrame = function()
         meta:SetJustifyH("LEFT")
         meta:SetText(format("kind=%s | entrance=%s | destination=%s%s",
             tostring(entry.kind or "?"),
-            tostring((entry.previousTarget and (entry.previousTarget.mapName or entry.previousTarget.maI)) or "?"),
-            tostring((entry.lastTarget and (entry.lastTarget.mapName or entry.lastTarget.maI)) or (entry.destination and (entry.destination.mapName or entry.destination.maI)) or "?"),
+            tostring(GetDisplayNameForPoint(entry.previousTarget)),
+            tostring(GetDisplayNameForPoint(entry.lastTarget or entry.destination)),
             entry.instance and format(" | instance=%s", tostring(entry.instanceType or "yes")) or ""
         ))
 
@@ -7659,6 +7887,24 @@ function ResolveMapIdByName(name)
     return nil
 end
 
+function BuildPointFromAnchor(maI, zx, zy, label, edgeType)
+    local map = GetMap()
+    if not (map and maI and zx and zy) then return nil end
+    local wx, wy = map:GWP(maI, zx, zy)
+    if not (wx and wy) then return nil end
+    return {
+        maI = maI,
+        wx = wx,
+        wy = wy,
+        zx = zx,
+        zy = zy,
+        mapName = map.ITN and map:ITN(maI) or ("Map " .. tostring(maI)),
+        edgeType = edgeType or "connector",
+        label = label,
+        forceStraight = true,
+    }
+end
+
 function CW.NormalizeZoneLookupKey(name)
     local s = tostring(name or "")
     if s == "" then return "" end
@@ -7772,11 +8018,66 @@ function CW.FormatZoneResolveMatches(matches)
     return table.concat(out, ", ")
 end
 
+
+function CW.ResolveManualTransportDestinationByName(name)
+    local targetKey = CW.NormalizeZoneLookupKey(name)
+    if not targetKey or targetKey == "" then
+        return nil, "empty-name"
+    end
+
+    local learned = EnsureTransportDb() or {}
+    local matches = {}
+
+    for _, edge in ipairs(learned) do
+        local kind = CanonicalTransportKind(edge.transportKind or edge.type or "transport")
+        if kind == "passage" or kind == "portal" or kind == "transport" then
+            for _, value in ipairs(CW.BuildTransportLookupAliases(edge)) do
+                if CW.NormalizeZoneLookupKey(value) == targetKey then
+                    matches[#matches + 1] = edge
+                    break
+                end
+            end
+        end
+    end
+
+    if #matches == 1 then
+        return matches[1], nil
+    end
+    if #matches > 1 then
+        return nil, "ambiguous"
+    end
+    return nil, "not-found"
+end
+
 function CW.AddWaypointFromZoneCoords(zoneName, zx, zy)
+    EnsureDb()
+
     local maI, why, matches = CW.ResolveMapIdBySmartName(zoneName)
+    local resolvedTransport, transportWhy = CW.ResolveManualTransportDestinationByName(zoneName)
+
+    local preferTransport =
+        resolvedTransport
+        and resolvedTransport.toMaI
+        and CW.TransportDestinationAliasMatches(resolvedTransport, zoneName)
+
+    if preferTransport then
+        maI = resolvedTransport.toMaI
+        why = nil
+        matches = nil
+    elseif not maI then
+        if resolvedTransport and resolvedTransport.toMaI then
+            maI = resolvedTransport.toMaI
+            why = nil
+        else
+            why = transportWhy or why
+        end
+    end
+
     if not maI then
         if why == "ambiguous-normalized" or why == "ambiguous-contains" then
             pr("zone match ambiguous: " .. tostring(zoneName) .. " → " .. tostring(CW.FormatZoneResolveMatches(matches) or "multiple matches"))
+        elseif why == "ambiguous" then
+            pr("zone match ambiguous: " .. tostring(zoneName))
         elseif why == "not-found" then
             pr("zone not found: " .. tostring(zoneName))
         else
@@ -7794,9 +8095,44 @@ function CW.AddWaypointFromZoneCoords(zoneName, zx, zy)
     local wasEmpty = #(STATE.db.destinations or {}) == 0
     PushHistorySnapshot("add-zone-coordinate-waypoint")
     STATE.lastCaptureTime = GetTime() or 0
+
+    local shouldInjectTransportPath =
+        preferTransport
+        and not CW.DoesPlayerAlreadyMatchZoneName(zoneName)
+
+    if shouldInjectTransportPath then
+        local transportLabel = tostring(resolvedTransport.label or resolvedTransport.toZoneName or zoneName)
+
+        local transportEntry = CW.BuildPointFromTransportEndpoint(
+            resolvedTransport,
+            "from",
+            "Transport entry: " .. transportLabel
+        )
+        local transportExit = CW.BuildPointFromTransportEndpoint(
+            resolvedTransport,
+            "to",
+            transportLabel
+        )
+
+        if transportEntry then
+            transportEntry.ts = date("%Y-%m-%d %H:%M:%S")
+            tinsert(STATE.db.destinations, transportEntry)
+        end
+
+        if transportExit and not CW.ArePointsNearSameLocation(transportExit, dest) then
+            transportExit.ts = date("%Y-%m-%d %H:%M:%S")
+            tinsert(STATE.db.destinations, transportExit)
+        end
+    end
+
     dest.userLabel = dest.userLabel or "wp"
     dest.ts = date("%Y-%m-%d %H:%M:%S")
-    tinsert(STATE.db.destinations, dest)
+
+    local lastQueued = STATE.db.destinations[#STATE.db.destinations]
+    if not CW.ArePointsNearSameLocation(lastQueued, dest) then
+        tinsert(STATE.db.destinations, dest)
+    end
+
     HandleQueueBecameNonEmpty("add-zone-coordinate-waypoint", wasEmpty)
     InvalidateRoute("zone coordinate waypoint added")
     RefreshUiHeader()
@@ -7805,24 +8141,6 @@ function CW.AddWaypointFromZoneCoords(zoneName, zx, zy)
     end
     pr(format("saved zone waypoint: %s %.1f %.1f", tostring(dest.mapName or zoneName or maI), dest.zx or -1, dest.zy or -1))
     return true, nil, dest
-end
-
-function BuildPointFromAnchor(maI, zx, zy, label, edgeType)
-    local map = GetMap()
-    if not (map and maI and zx and zy) then return nil end
-    local wx, wy = map:GWP(maI, zx, zy)
-    if not (wx and wy) then return nil end
-    return {
-        maI = maI,
-        wx = wx,
-        wy = wy,
-        zx = zx,
-        zy = zy,
-        mapName = map.ITN and map:ITN(maI) or ("Map " .. tostring(maI)),
-        edgeType = edgeType or "connector",
-        label = label,
-        forceStraight = true,
-    }
 end
 
 function ResolveSouthKalimdorFallbackIds()
@@ -8182,13 +8500,37 @@ local function ShowWaypointMetadataPopup(opts)
         self:ClearFocus()
         FocusNextMetadataBox(self, IsShiftKeyDown and IsShiftKeyDown())
     end)
+
+    local zoneLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    zoneLabel:SetPoint("TOPLEFT", descLabel, "BOTTOMLEFT", 0, -26)
+    zoneLabel:SetText("Zone/Subzone")
+
+    local zoneBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    zoneBox:SetAutoFocus(false)
+    zoneBox:SetWidth(360)
+    zoneBox:SetHeight(20)
+    zoneBox:SetPoint("LEFT", zoneLabel, "RIGHT", 10, 0)
+    zoneBox:SetText(opts.defaultZoneName or "")
+    zoneBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    zoneBox:SetScript("OnEnterPressed", function(self)
+        self:ClearFocus()
+        CommitWaypointMetadata()
+    end)
+    zoneBox:SetScript("OnTabPressed", function(self)
+        self:ClearFocus()
+        FocusNextMetadataBox(self, IsShiftKeyDown and IsShiftKeyDown())
+    end)
     
     local extraCheckboxes = {}
-    local lastAnchor = descLabel
+    local lastAnchor = zoneLabel
     if type(opts.extraCheckboxes) == "table" and #opts.extraCheckboxes > 0 then
         for i, def in ipairs(opts.extraCheckboxes) do
             local cb = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
-            cb:SetPoint("TOPLEFT", lastAnchor, "BOTTOMLEFT", 0, (i == 1) and -22 or -26)
+            if i == 1 then
+                cb:SetPoint("TOPLEFT", lastAnchor, "BOTTOMLEFT", 0, -22)
+            else
+                cb:SetPoint("LEFT", lastAnchor, "RIGHT", 80, 0)
+            end            
             cb:SetChecked(def.checked and true or false)
 
             local cbLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -8213,7 +8555,7 @@ local function ShowWaypointMetadataPopup(opts)
         end
     end
 
-    metadataBoxes = { nameBox, labelBox, descBox }
+    metadataBoxes = { nameBox, labelBox, descBox, zoneBox }
 
     FocusNextMetadataBox = function(current, backwards)
         local currentIndex = 1
@@ -8250,6 +8592,7 @@ local function ShowWaypointMetadataPopup(opts)
                 name = TrimEditorMetadataValue(nameBox:GetText()),
                 label = TrimEditorMetadataValue(labelBox:GetText()),
                 description = TrimEditorMetadataValue(descBox:GetText()),
+                zoneName = TrimEditorMetadataValue(zoneBox:GetText()),
                 extraValues = extraValues,
             })
         end
@@ -8278,6 +8621,7 @@ local function ShowWaypointMetadataPopup(opts)
         if nameBox and nameBox.ClearFocus then nameBox:ClearFocus() end
         if labelBox and labelBox.ClearFocus then labelBox:ClearFocus() end
         if descBox and descBox.ClearFocus then descBox:ClearFocus() end
+        if zoneBox and zoneBox.ClearFocus then zoneBox:ClearFocus() end
         if STATE.waypointMetadataPopup and STATE.waypointMetadataPopup.frame == self then
             STATE.waypointMetadataPopup = nil
         end
@@ -8288,6 +8632,7 @@ local function ShowWaypointMetadataPopup(opts)
         nameBox = nameBox,
         labelBox = labelBox,
         descBox = descBox,
+        zoneBox = zoneBox,
     }
 
     ArmKeyboardModalFrame(f)
@@ -8331,6 +8676,7 @@ AddLabeledCurrentCursorWaypoint = function()
         defaultName = BuildDefaultWaypointName(dest),
         defaultLabel = "wp",
         defaultDescription = "",
+        defaultZoneName = dest.subZoneText or dest.zoneText or dest.mapName or "",
         onSave = function(meta)
             local wasEmpty = #(STATE.db.destinations or {}) == 0
             PushHistorySnapshot("add-labeled-waypoint")
@@ -8338,6 +8684,10 @@ AddLabeledCurrentCursorWaypoint = function()
             dest.userName = meta.name ~= "" and meta.name or nil
             dest.userLabel = meta.label ~= "" and meta.label or nil
             dest.description = meta.description ~= "" and meta.description or nil
+            if meta.zoneName ~= "" then
+                dest.subZoneText = meta.zoneName
+                dest.zoneText = meta.zoneName
+            end
             tinsert(STATE.db.destinations, dest)
             HandleQueueBecameNonEmpty("add-labeled-waypoint", wasEmpty)
             InvalidateRoute("labeled waypoint added")
@@ -8904,7 +9254,7 @@ SlashHandler = function(msg)
     msg = string.lower(rawMsg)
 
     if msg == "" or msg == "help" then
-        pr("commands: /cw <zone> <x> <y> | ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | autodiscovery | hasflying | flightmasters | deep | minimal | debug | debugfm <name> | simplify | legend | transports | cleartransports | transportlog | transportconfirmation | managetransports | saveroute | savehere")
+        pr("commands: /cw ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | autodiscovery | hasflying | flightmasters | deep | minimal | debug | debugfm <name> | simplify | legend | transports | cleartransports | transportlog | transportconfirmation | managetransports | saveroute | savehere")
         return
     elseif msg == "ui" or msg == "panel" or msg == "window" then
         EnsureUi()
@@ -9040,7 +9390,7 @@ SlashHandler = function(msg)
         if parsed then
             CW.AddWaypointFromZoneCoords(parsed.zoneName, parsed.zx, parsed.zy)
         elseif parseWhy == "coords-out-of-range" then
-            pr("coordinates must be between 0 and 100: " .. tostring(rawMsg))
+            pr("zone coordinates out of range: expected 0-100 values")
         else
             pr("unknown command: " .. tostring(msg))
         end
