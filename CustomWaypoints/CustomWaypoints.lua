@@ -7659,6 +7659,154 @@ function ResolveMapIdByName(name)
     return nil
 end
 
+function CW.NormalizeZoneLookupKey(name)
+    local s = tostring(name or "")
+    if s == "" then return "" end
+    s = lower(s)
+    s = gsub(s, "%b()", " ")
+    s = gsub(s, "['`´’]", "")
+    s = gsub(s, "[%-_,:/.]", " ")
+    s = gsub(s, "[^%w%s]", " ")
+    s = gsub(s, "^the%s+", "")
+    s = gsub(s, "%s+the%s+", " ")
+    s = gsub(s, "%s+", " ")
+    s = gsub(s, "^%s+", "")
+    s = gsub(s, "%s+$", "")
+    return s
+end
+
+function CW.ResolveMapIdBySmartName(name)
+    local map = GetMap()
+    if not (map and name and map.ITN) then return nil, "no-map" end
+
+    local rawTarget = lower(tostring(name or ""))
+    rawTarget = gsub(rawTarget, "^%s+", "")
+    rawTarget = gsub(rawTarget, "%s+$", "")
+    local normalizedTarget = CW.NormalizeZoneLookupKey(name)
+    if normalizedTarget == "" then
+        return nil, "empty-zone"
+    end
+
+    local normalizedMatches = nil
+    local containsMatches = nil
+
+    for maI = 1, 5000 do
+        local mapName = map:ITN(maI)
+        if mapName and mapName ~= "" then
+            local rawCandidate = lower(tostring(mapName))
+            if rawCandidate == rawTarget then
+                return maI, nil
+            end
+
+            local normalizedCandidate = CW.NormalizeZoneLookupKey(mapName)
+            if normalizedCandidate ~= "" then
+                if normalizedCandidate == normalizedTarget then
+                    normalizedMatches = normalizedMatches or {}
+                    normalizedMatches[#normalizedMatches + 1] = { maI = maI, mapName = mapName }
+                elseif string.find(normalizedCandidate, normalizedTarget, 1, true) or string.find(normalizedTarget, normalizedCandidate, 1, true) then
+                    containsMatches = containsMatches or {}
+                    containsMatches[#containsMatches + 1] = { maI = maI, mapName = mapName }
+                end
+            end
+        end
+    end
+
+    if normalizedMatches and #normalizedMatches == 1 then
+        return normalizedMatches[1].maI, nil
+    end
+    if normalizedMatches and #normalizedMatches > 1 then
+        return nil, "ambiguous-normalized", normalizedMatches
+    end
+
+    if containsMatches and #containsMatches == 1 then
+        return containsMatches[1].maI, nil
+    end
+    if containsMatches and #containsMatches > 1 then
+        return nil, "ambiguous-contains", containsMatches
+    end
+
+    return nil, "not-found"
+end
+
+function CW.ParseZoneCoordinateNumber(token)
+    token = tostring(token or "")
+    token = gsub(token, ",", ".")
+    if not match(token, "^%-?%d+%.?%d*$") and not match(token, "^%-?%d*%.%d+$") then
+        return nil
+    end
+    return tonumber(token)
+end
+
+function CW.ParseZoneAndCoordsFromSlashArgs(rawMsg)
+    local zonePart, xToken, yToken = tostring(rawMsg or ""):match("^(.-)%s+([^%s]+)%s+([^%s]+)$")
+    if not zonePart then return nil end
+
+    zonePart = gsub(zonePart, "^%s+", "")
+    zonePart = gsub(zonePart, "%s+$", "")
+    if zonePart == "" then return nil end
+
+    local zx = CW.ParseZoneCoordinateNumber(xToken)
+    local zy = CW.ParseZoneCoordinateNumber(yToken)
+    if not (zx and zy) then return nil end
+    if zx < 0 or zx > 100 or zy < 0 or zy > 100 then
+        return nil, "coords-out-of-range"
+    end
+
+    return {
+        zoneName = zonePart,
+        zx = zx,
+        zy = zy,
+    }
+end
+
+function CW.FormatZoneResolveMatches(matches)
+    if type(matches) ~= "table" or #matches == 0 then return nil end
+    local out = {}
+    local limit = math.min(#matches, 3)
+    for i = 1, limit do
+        out[#out + 1] = tostring(matches[i].mapName or matches[i].maI or "?")
+    end
+    if #matches > limit then
+        out[#out + 1] = "+" .. tostring(#matches - limit) .. " more"
+    end
+    return table.concat(out, ", ")
+end
+
+function CW.AddWaypointFromZoneCoords(zoneName, zx, zy)
+    local maI, why, matches = CW.ResolveMapIdBySmartName(zoneName)
+    if not maI then
+        if why == "ambiguous-normalized" or why == "ambiguous-contains" then
+            pr("zone match ambiguous: " .. tostring(zoneName) .. " → " .. tostring(CW.FormatZoneResolveMatches(matches) or "multiple matches"))
+        elseif why == "not-found" then
+            pr("zone not found: " .. tostring(zoneName))
+        else
+            pr("zone resolve failed: " .. tostring(zoneName) .. " (" .. tostring(why) .. ")")
+        end
+        return false, why
+    end
+
+    local dest = BuildPointFromAnchor(maI, zx, zy, nil, "connector")
+    if not dest then
+        pr("coordinate conversion failed: " .. tostring(zoneName) .. " " .. tostring(zx) .. " " .. tostring(zy))
+        return false, "point-build-failed"
+    end
+
+    local wasEmpty = #(STATE.db.destinations or {}) == 0
+    PushHistorySnapshot("add-zone-coordinate-waypoint")
+    STATE.lastCaptureTime = GetTime() or 0
+    dest.userLabel = dest.userLabel or "wp"
+    dest.ts = date("%Y-%m-%d %H:%M:%S")
+    tinsert(STATE.db.destinations, dest)
+    HandleQueueBecameNonEmpty("add-zone-coordinate-waypoint", wasEmpty)
+    InvalidateRoute("zone coordinate waypoint added")
+    RefreshUiHeader()
+    if STATE.db.autoSyncToCarbonite then
+        SyncQueueToCarbonite()
+    end
+    pr(format("saved zone waypoint: %s %.1f %.1f", tostring(dest.mapName or zoneName or maI), dest.zx or -1, dest.zy or -1))
+    return true, nil, dest
+end
+
 function BuildPointFromAnchor(maI, zx, zy, label, edgeType)
     local map = GetMap()
     if not (map and maI and zx and zy) then return nil end
@@ -8756,7 +8904,7 @@ SlashHandler = function(msg)
     msg = string.lower(rawMsg)
 
     if msg == "" or msg == "help" then
-        pr("commands: /cw ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | autodiscovery | hasflying | flightmasters | deep | minimal | debug | debugfm <name> | simplify | legend | transports | cleartransports | transportlog | transportconfirmation | managetransports | saveroute | savehere")
+        pr("commands: /cw <zone> <x> <y> | ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | autodiscovery | hasflying | flightmasters | deep | minimal | debug | debugfm <name> | simplify | legend | transports | cleartransports | transportlog | transportconfirmation | managetransports | saveroute | savehere")
         return
     elseif msg == "ui" or msg == "panel" or msg == "window" then
         EnsureUi()
@@ -8888,7 +9036,14 @@ SlashHandler = function(msg)
         local idx = tonumber(msg:match("^routeknown%s+(%d+)$"))
         RouteToKnownLocation(idx)
     else
-        pr("unknown command: " .. tostring(msg))
+        local parsed, parseWhy = CW.ParseZoneAndCoordsFromSlashArgs(rawMsg)
+        if parsed then
+            CW.AddWaypointFromZoneCoords(parsed.zoneName, parsed.zx, parsed.zy)
+        elseif parseWhy == "coords-out-of-range" then
+            pr("coordinates must be between 0 and 100: " .. tostring(rawMsg))
+        else
+            pr("unknown command: " .. tostring(msg))
+        end
     end
 end
 
