@@ -18,89 +18,35 @@ For more implementation details, see the [CustomWaypoints README](CustomWaypoint
 ---
 
 ## Quick Start
+1. Download and unzip the projects:
 
-1. Copy the repo folders into your WoW install under:
+<img src="CustomWaypoints/samples/screenshots/download.png" width="300" style="margin-left: 30px;" alt="CustomWaypoints logo">
+
+2. Copy the repo folders into your WoW install under:
 
    ```text
    Interface\AddOns\
    ```
 
-2. Enable **Carbonite** and **CustomWaypoints** from the AddOns screen.
+3. Enable **Carbonite** and **CustomWaypoints** from the AddOns screen.
 
-3. In game, run:
+4. In game, run:
 
    ```text
    /cw help
    ```
 
-4. Open the CustomWaypoints UI:
+5. Open the CustomWaypoints UI:
 
    ```text
    /cw ui
    ```
 
-5. Add a waypoint from the Carbonite map with:
+6. Add a waypoint from the Carbonite map with:
 
    ```text
    Shift + Left Click
    ```
-
----
-
-## The Mental Model
-
-CustomWaypoints has three main ideas:
-
-### 1. Your current queue
-
-The queue is the list of waypoints you want to visit now.
-
-You can add points from the map, commands, saved locations, saved routes, or Carbonite search data. When auto-sync is enabled, CustomWaypoints pushes the current route into Carbonite so Carbonite can render and guide it.
-
-### 2. Known Locations
-
-Known Locations are reusable saved paths:
-
-- single locations
-- saved routes with multiple waypoints
-- transports / portals / passages
-- flight-master-style links
-- imported route data
-
-Open them with:
-
-```text
-/cw knownlocations
-```
-
-or the keybind:
-
-```text
-Shift + G
-```
-
-### 3. Destination search
-
-If you type something that is not a normal `/cw` command, CustomWaypoints can treat it as a destination search.
-
-For example:
-
-```text
-/cw dalaran
-/cw underbelly
-/cw doras
-/cw mailbox
-/cw valiance keep
-```
-
-It searches across:
-
-- your Known Locations
-- saved routes
-- Carbonite favorites / notes / targets, when available
-- Carbonite Guide POIs such as NPCs, mailboxes, bankers, auctioneers, innkeepers, trainers, and flight masters
-
-If there is one clear best match, it routes immediately. If the match is ambiguous, it opens the Destination Search window so you can choose the exact result.
 
 ---
 
@@ -200,7 +146,7 @@ If the result is clear, the route is created immediately. If several results are
 or the keybind:
 
 ```text
-Shift + G
+Shift + R
 ```
 
 This opens the save/metadata flow for your current player location.
@@ -220,6 +166,12 @@ Saved routes can later be found from Known Locations or by typing `/cw <route na
 /cw knownlocations
 ```
 
+or 
+
+```
+Shift + G
+```
+
 Use this window to browse, edit, delete, import, export, and route to saved known locations and routes.
 
 ---
@@ -230,13 +182,13 @@ Use this window to browse, edit, delete, import, export, and route to saved know
 |----------|--------|
 | **Shift + Left Click** | Capture waypoint from the Carbonite world map |
 | **Ctrl + Shift + Left Click** | Capture waypoint with metadata |
-| **Ctrl + Right Click** | Fallback waypoint capture |
 | **Ctrl + Shift + Z** | Undo last queue action |
 | **Ctrl + Shift + Y** | Redo last undone queue action |
 | **Shift + R** | Save waypoint at current player location (`Save Here`) |
 | **Shift + G** | Open Known Locations |
 | **Esc** | Close the most recently opened CustomWaypoints UI frame |
 | **Shift + Delete** | Delete selected entry in Known Locations |
+| **Ctrl + Shift + C** | Clear queue |
 
 > Some keybinds may not fire if another addon or WoW binding already owns them.
 
@@ -336,3 +288,27 @@ CustomWaypoints/docs/invariants.md
 ```
 
 For routing changes, keep the scope small and preserve the distinction between minimal and deep mode. CustomWaypoints should extend Carbonite safely, not replace it wholesale.
+
+## Contact & Feedback
+
+For bug reports, suggestions, or questions about CustomWaypoints:
+
+- Open an issue in this repository
+   - GitHub: https://github.com/dimgatz98/Carbonite-3.3.5a-Remastered/issues/new
+- Or reach out via:
+  - Discussions: [https://github.com/dimgatz98/Carbonite-3.3.5a-Remastered/discussions](https://github.com/dimgatz98/Carbonite-3.3.5a-Remastered/discussions)
+
+Please include:
+- What you were trying to do
+- What happened instead
+- Any relevant `/cw` output or screenshots
+
+---
+
+## Support the project
+
+If you find CustomWaypoints useful, you can support its development:
+
+☕ https://buymeacoffee.com/baddcafe
+
+Every bit of support helps.

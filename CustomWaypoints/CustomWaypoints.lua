@@ -4375,7 +4375,7 @@ RouteToKnownLocation = function(index)
             tinsert(STATE.db.destinations, cloned[i])
         end
         HandleQueueBecameNonEmpty("route-known-location", wasEmpty)
-        pr(format("loaded known route: %s (%d stop(s))", tostring(entry.name or index), #cloned))
+        dbg(format("loaded known route: %s (%d stop(s))", tostring(entry.name or index), #cloned))
     else
         local dest = CloneKnownLocationDestination(entry)
         if not dest then
@@ -4384,7 +4384,7 @@ RouteToKnownLocation = function(index)
         end
         tinsert(STATE.db.destinations, dest)
         HandleQueueBecameNonEmpty("route-known-location", wasEmpty)
-        pr(format("routing to known location: %s", tostring(entry.name or dest.mapName or dest.maI)))
+        dbg(format("routing to known location: %s", tostring(entry.name or dest.mapName or dest.maI)))
     end
 
     InvalidateRoute("known location selected")
@@ -4548,7 +4548,7 @@ SaveQueueAsKnownRoute = function()
                 STATE.db.knownLocations[#STATE.db.knownLocations + 1] = candidate
                 InvalidateRoute("saved manual transport anchor")
                 RefreshKnownLocationsFrame()
-                SafePr("saved known transport: " .. tostring(candidate.name or candidate.key))
+                dbg("saved known transport: " .. tostring(candidate.name or candidate.key))
                 return
             end
 
@@ -4612,7 +4612,7 @@ local function DeleteKnownLocationEntry(entry)
         end
         table.remove(learned, transportIndex)
         InvalidateRoute("deleted learned transport from known locations")
-        pr("deleted learned transport: " .. tostring(entry.name or transportIndex))
+        dbg("deleted learned transport: " .. tostring(entry.name or transportIndex))
         return true
     end
 
@@ -4640,7 +4640,7 @@ local function DeleteKnownLocationEntry(entry)
     table.remove(known, sourceIndex)
 
     InvalidateRoute("deleted known location entry")
-    pr("deleted known location: " .. tostring((removed and removed.name) or entry.name or sourceIndex))
+    dbg("deleted known location: " .. tostring((removed and removed.name) or entry.name or sourceIndex))
     return true
 end
 
@@ -5029,7 +5029,7 @@ local function ShowKnownPointEditorPopup(sourceIndex, loc, titleText)
 
             RefreshKnownLocationsFrame()
             InvalidateRoute("edited known transport from unified editor")
-            pr("updated known transport: " .. tostring(edge.label or loc.name or sourceIndex))
+            dbg("updated known transport: " .. tostring(edge.label or loc.name or sourceIndex))
             f:Hide()
             return
         end
@@ -5104,7 +5104,7 @@ local function ShowKnownPointEditorPopup(sourceIndex, loc, titleText)
         InvalidateRoute("edited known route")
 
         RefreshKnownLocationsFrame()
-        pr("updated known route: " .. tostring(stored.name or sourceIndex) .. " (" .. tostring(#(stored.routePoints or {})) .. " waypoint(s))")
+        dbg("updated known route: " .. tostring(stored.name or sourceIndex) .. " (" .. tostring(#(stored.routePoints or {})) .. " waypoint(s))")
         f:Hide()
     end)
 
@@ -6252,353 +6252,6 @@ ShowKnownLocationsFrame = function()
     f:Show()
     RefreshCwEscOverride()
     QueueKnownLocationsSearchFocus()
-end
-
-local function ShowTransportManagementFrame()
-    if STATE.transportManagementFrame then
-        if STATE.transportManagementFrame:IsShown() then
-            STATE.transportManagementFrame:Hide()
-        else
-            STATE.transportManagementFrame:Show()
-            ArmKeyboardModalFrame(STATE.transportManagementFrame)
-        end
-        return
-    end
-
-    local f = CreateFrame("Frame", "CustomWaypointsTransportManagement", UIParent)
-    f:SetWidth(640)
-    f:SetHeight(440)
-    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-    f:SetFrameStrata("DIALOG")
-    f:SetFrameLevel(90)
-    f:SetClampedToScreen(true)
-    f:EnableMouse(true)
-    f:SetMovable(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
-    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
-
-    local bg = f:CreateTexture(nil, "BACKGROUND")
-    bg:SetAllPoints(f)
-    bg:SetTexture(0, 0, 0, 0.9)
-
-    if f.SetBackdrop then
-        f:SetBackdrop({
-            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile = true, tileSize = 16, edgeSize = 16,
-            insets = { left = 4, right = 4, top = 4, bottom = 4 }
-        })
-    end
-
-    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    title:SetPoint("TOP", f, "TOP", 0, -20)
-    title:SetText("CustomWaypoints - Transport / Instance Management")
-
-    local instructions = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    instructions:SetPoint("TOP", title, "BOTTOM", 0, -10)
-    instructions:SetWidth(590)
-    instructions:SetJustifyH("CENTER")
-    instructions:SetText("Delete learned transports and saved instance entrances")
-
-    local scrollFrame = CreateFrame("ScrollFrame", "TransportManagementScrollFrame", f, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -60)
-    scrollFrame:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -40, 50)
-
-    local content = CreateFrame("Frame", nil, scrollFrame)
-    content:SetSize(560, 1)
-    scrollFrame:SetScrollChild(content)
-
-    local function RefreshTransportList()
-        for _, child in ipairs({content:GetChildren()}) do
-            child:Hide()
-            child:SetParent(nil)
-        end
-        content.checkboxes = nil
-
-        EnsureDb()
-        local learned = EnsureTransportDb()
-        local known = STATE.db.knownLocations or {}
-
-        local rows = {}
-
-        for i, edge in ipairs(learned or {}) do
-            rows[#rows + 1] = {
-                entryType = "transport",
-                index = i,
-                label = format("%s (uses: %d)", TransportLabel(edge), edge.uses or 1),
-                meta = format(
-                    "type=transport | from=%s | to=%s",
-                    tostring(edge.fromMapName or edge.fromMaI or "?"),
-                    tostring(edge.toMapName or edge.toMaI or "?")
-                ),
-            }
-        end
-
-        for i, loc in ipairs(known or {}) do
-            if loc and loc.kind == "instance" then
-                rows[#rows + 1] = {
-                    entryType = "instance",
-                    index = i,
-                    label = tostring(loc.name or ("Instance " .. tostring(i))),
-                    meta = format(
-                        "type=instance | entrance=%s | key=%s",
-                        tostring((loc.destination and (loc.destination.mapName or loc.destination.maI)) or loc.mapName or "?"),
-                        tostring(loc.key or "?")
-                    ),
-                }
-            end
-        end
-
-        if #rows == 0 then
-            local empty = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            empty:SetPoint("TOP", content, "TOP", 0, -10)
-            empty:SetText("No saved transports or instance entrances found")
-            content:SetHeight(40)
-            return
-        end
-
-        table.sort(rows, function(a, b)
-            local at = tostring(a.entryType or "")
-            local bt = tostring(b.entryType or "")
-            if at ~= bt then
-                return at < bt
-            end
-            return lower(tostring(a.label or "")) < lower(tostring(b.label or ""))
-        end)
-
-        local yOffset = -10
-        local checkboxes = {}
-
-        for i, rowData in ipairs(rows) do
-            local entry = CreateFrame("Frame", nil, content)
-            entry:SetSize(540, 38)
-            entry:SetPoint("TOPLEFT", content, "TOPLEFT", 0, yOffset)
-
-            local cb = CreateFrame("CheckButton", nil, entry, "UICheckButtonTemplate")
-            cb:SetPoint("TOPLEFT", entry, "TOPLEFT", 4, -4)
-            cb.entryType = rowData.entryType
-            cb.entryIndex = rowData.index
-            checkboxes[i] = cb
-
-            local label = entry:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            label:SetPoint("TOPLEFT", cb, "TOPRIGHT", 8, -2)
-            label:SetWidth(470)
-            label:SetJustifyH("LEFT")
-            label:SetText(rowData.label)
-
-            local meta = entry:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            meta:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -4)
-            meta:SetWidth(470)
-            meta:SetJustifyH("LEFT")
-            meta:SetText(rowData.meta)
-
-            yOffset = yOffset - 40
-        end
-
-        content.checkboxes = checkboxes
-        content:SetHeight(-yOffset + 20)
-    end
-
-    local deleteBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    deleteBtn:SetWidth(140)
-    deleteBtn:SetHeight(25)
-    deleteBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 20, 15)
-    deleteBtn:SetText("Delete Selected")
-    deleteBtn:SetScript("OnClick", function()
-        local transportsToDelete = {}
-        local instancesToDelete = {}
-
-        if content.checkboxes then
-            for _, cb in pairs(content.checkboxes) do
-                if cb:GetChecked() then
-                    if cb.entryType == "transport" then
-                        tinsert(transportsToDelete, cb.entryIndex)
-                    elseif cb.entryType == "instance" then
-                        tinsert(instancesToDelete, cb.entryIndex)
-                    end
-                end
-            end
-        end
-
-        if #transportsToDelete == 0 and #instancesToDelete == 0 then
-            pr("No transports or instance entrances selected for deletion")
-            return
-        end
-
-        table.sort(transportsToDelete, function(a, b) return a > b end)
-        table.sort(instancesToDelete, function(a, b) return a > b end)
-
-        local learned = EnsureTransportDb()
-        local known = STATE.db.knownLocations or {}
-
-        for _, index in ipairs(transportsToDelete) do
-            table.remove(learned, index)
-        end
-
-        for _, index in ipairs(instancesToDelete) do
-            table.remove(known, index)
-        end
-
-        InvalidateRoute("deleted saved transport/instance entries")
-        RefreshTransportList()
-
-        pr(format(
-            "Deleted %d transport(s) and %d instance entrance(s)",
-            #transportsToDelete,
-            #instancesToDelete
-        ))
-    end)
-
-    local function ShowClearAllConfirmation(onConfirm)
-        local cf = CreateFrame("Frame", "CustomWaypointsTransportManagement", UIParent)
-        cf:SetWidth(360)
-        cf:SetHeight(150)
-        cf:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-        cf:SetFrameStrata("DIALOG")
-        cf:SetFrameLevel((f:GetFrameLevel() or 90) + 20)
-        cf:SetClampedToScreen(true)
-        cf:EnableMouse(true)
-        cf:SetMovable(true)
-        cf:RegisterForDrag("LeftButton")
-        cf:SetScript("OnDragStart", function(self) self:StartMoving() end)
-        cf:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
-
-        -- ESC closes only. No keyboard confirm.
-        if cf.EnableKeyboard then cf:EnableKeyboard(false) end
-        cf:SetScript("OnKeyDown", function(self, key)
-            if key == "ESCAPE" then
-                self:Hide()
-            end
-        end)
-
-        local bg = cf:CreateTexture(nil, "BACKGROUND")
-        bg:SetAllPoints(cf)
-        bg:SetTexture(0, 0, 0, 0.92)
-
-        if cf.SetBackdrop then
-            cf:SetBackdrop({
-                bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-                tile = true, tileSize = 16, edgeSize = 16,
-                insets = { left = 4, right = 4, top = 4, bottom = 4 }
-            })
-        end
-
-        local title = cf:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        title:SetPoint("TOP", cf, "TOP", 0, -14)
-        title:SetText("Confirm Clear All")
-
-        local msg = cf:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        msg:SetPoint("TOPLEFT", cf, "TOPLEFT", 20, -42)
-        msg:SetPoint("RIGHT", cf, "RIGHT", -20, 0)
-        msg:SetJustifyH("LEFT")
-        msg:SetJustifyV("TOP")
-        msg:SetText("This will delete all learned transports and all saved instance entrances.")
-
-        local cancelBtn = CreateFrame("Button", nil, cf, "UIPanelButtonTemplate")
-        cancelBtn:SetWidth(100)
-        cancelBtn:SetHeight(24)
-        cancelBtn:SetPoint("BOTTOMLEFT", cf, "BOTTOMLEFT", 24, 18)
-        cancelBtn:SetText("Cancel")
-        cancelBtn:SetScript("OnClick", function()
-            cf:Hide()
-        end)
-
-        local confirmBtn = CreateFrame("Button", nil, cf, "UIPanelButtonTemplate")
-        confirmBtn:SetWidth(120)
-        confirmBtn:SetHeight(24)
-        confirmBtn:SetPoint("BOTTOMRIGHT", cf, "BOTTOMRIGHT", -24, 18)
-        confirmBtn:SetText("Clear All")
-        confirmBtn:SetScript("OnClick", function()
-            if onConfirm then
-                onConfirm()
-            end
-            cf:Hide()
-        end)
-
-        cf:SetScript("OnHide", function(self)
-            if self.EnableKeyboard then self:EnableKeyboard(false) end
-            self:SetParent(nil)
-        end)
-
-        cf:SetScript("OnShow", function(self)
-            PushCwModalFrame(self)
-            if self.EnableKeyboard then self:EnableKeyboard(false) end
-            if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
-        end)
-
-        cf:SetScript("OnHide", function(self)
-            RemoveCwModalFrame(self)
-            if self.EnableKeyboard then self:EnableKeyboard(false) end
-            if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
-            self:SetParent(nil)
-        end)
-
-        cf:SetScript("OnMouseDown", function(self)
-            PushCwModalFrame(self)
-        end)
-
-        cf:Show()
-    end
-
-    local clearAllBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    clearAllBtn:SetWidth(120)
-    clearAllBtn:SetHeight(25)
-    clearAllBtn:SetPoint("LEFT", deleteBtn, "RIGHT", 10, 0)
-    clearAllBtn:SetText("Clear All")
-    clearAllBtn:SetScript("OnClick", function()
-        ShowClearAllConfirmation(function()
-            local learned = EnsureTransportDb()
-            local known = STATE.db.knownLocations or {}
-
-            local removedInstances = 0
-            for i = #known, 1, -1 do
-                if known[i] and known[i].kind == "instance" then
-                    table.remove(known, i)
-                    removedInstances = removedInstances + 1
-                end
-            end
-
-            local removedTransports = #learned
-            wipe(learned)
-
-            InvalidateRoute("cleared all transports and instances")
-            RefreshTransportList()
-
-            pr(format(
-                "Cleared %d transport(s) and %d instance entrance(s)",
-                removedTransports,
-                removedInstances
-            ))
-        end)
-    end)
-
-    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
-    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
-    close:SetScript("OnClick", function()
-        f:Hide()
-    end)
-
-    f:SetScript("OnShow", function(self)
-        PushCwModalFrame(self)
-        if self.EnableKeyboard then self:EnableKeyboard(false) end
-        if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
-    end)
-
-    f:SetScript("OnHide", function(self)
-        RemoveCwModalFrame(self)
-        if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
-        if self.EnableKeyboard then self:EnableKeyboard(false) end
-    end)
-    f:SetScript("OnMouseDown", function(self)
-        PushCwModalFrame(self)
-    end)
-
-    STATE.transportManagementFrame = f
-    RefreshTransportList()
-    f:Show()
-    ArmKeyboardModalFrame(f)
 end
 
 function CustomWaypoints_ToggleKnownLocations()
@@ -8221,7 +7874,7 @@ UndoHistory = function()
         -- First "nothing to undo" with a non-empty queue = clear all stops (redo can restore).
         local d = STATE.db.destinations
         if #(d or {}) == 0 then
-            pr("undo: nothing to undo")
+            dbg("undo: nothing to undo")
             return
         end
         STATE.future = STATE.future or {}
@@ -8236,7 +7889,7 @@ UndoHistory = function()
         else
             ClearCarboniteTargets()
         end
-        pr("undo: cleared queue (no session history — e.g. after /reload); use redo to restore")
+        dbg("undo: cleared queue (no session history — e.g. after /reload); use redo to restore")
         RefreshUiHeader()
         return
     end
@@ -8247,7 +7900,7 @@ UndoHistory = function()
     }
     local snapshot = tremove(hist)
     RestoreSnapshot(snapshot, "undo")
-    pr(format("undo: restored queue (%d stop(s))", #(STATE.db.destinations or {})))
+    dbg(format("undo: restored queue (%d stop(s))", #(STATE.db.destinations or {})))
     RefreshUiHeader()
 end
 
@@ -9522,7 +9175,7 @@ local function RemoveFirstWaypoint(reason)
         PushHistorySnapshot("pop-waypoint")
     end
     local first = tremove(STATE.db.destinations, 1)
-    pr(format("completed #1 => %s (reason=%s)", first.mapName or ("Map " .. tostring(first.maI)), reason or "reach"))
+    dbg(format("completed #1 => %s (reason=%s)", first.mapName or ("Map " .. tostring(first.maI)), reason or "reach"))
     InvalidateRoute("advanced queue")
     SyncQueueToCarbonite()
 end
@@ -9667,7 +9320,7 @@ local function RouteSummary()
     dbg(format("queue=%d carboniteTargets=%d expandedRoute=%d syncPoints=%d totalCost=%.1f sec explored=%d hasFlyingMount=%s simplifyTransit=%s useFlightMasters=%s",
         #STATE.db.destinations, #tar, #route.points, #syncPoints, route.totalCost or -1, route.explored or -1, tostring(STATE.db.hasFlyingMount), tostring(STATE.db.simplifyTransitWaypoints), tostring(STATE.db.useFlightMasters)))
 
-    pr(format("route: %d queue stop(s), %d point(s), ~%.0fs", #STATE.db.destinations, #route.points, route.totalCost or 0))
+    dbg(format("route: %d queue stop(s), %d point(s), ~%.0fs", #STATE.db.destinations, #route.points, route.totalCost or 0))
 
     for i, pt in ipairs(route.points) do
         dbg(format("route %d: maI=%d (%s) zx=%.1f zy=%.1f wx=%.3f wy=%.3f edge=%s cost=%.1f label=%s",
@@ -9911,10 +9564,10 @@ function CW.ExportWaypoints()
 end
 
 function CW.DebugFlightMaster(name)
-    pr("---- FM DEBUG START ----")
+    dbg("---- FM DEBUG START ----")
 
     if not name or name == "" then
-        pr("usage: /cw debugfm <name>")
+        dbg("usage: /cw debugfm <name>")
         return
     end
 
@@ -9927,8 +9580,8 @@ function CW.DebugFlightMaster(name)
     end
 
     local inputNorm = norm(name)
-    pr("input=" .. tostring(name))
-    pr("inputNorm=" .. tostring(inputNorm))
+    dbg("input=" .. tostring(name))
+    dbg("inputNorm=" .. tostring(inputNorm))
 
     local foundTaxi = false
     if NxCData and type(NxCData["Taxi"]) == "table" then
@@ -9936,19 +9589,19 @@ function CW.DebugFlightMaster(name)
             if v then
                 local nk = norm(k)
                 if nk == inputNorm then
-                    pr("NxCData exact known match: " .. tostring(k))
+                    dbg("NxCData exact known match: " .. tostring(k))
                     foundTaxi = true
                 elseif nk and inputNorm and string.find(nk, inputNorm, 1, true) then
-                    pr("NxCData partial known match: " .. tostring(k))
+                    dbg("NxCData partial known match: " .. tostring(k))
                 end
             end
         end
     else
-        pr("NxCData Taxi table unavailable")
+        dbg("NxCData Taxi table unavailable")
     end
 
     if not foundTaxi then
-        pr("NxCData exact known match: none")
+        dbg("NxCData exact known match: none")
     end
 
     local foundNode = false
@@ -9959,31 +9612,31 @@ function CW.DebugFlightMaster(name)
                     if type(nod) == "table" and nod.LoN then
                         local nk = norm(nod.LoN)
                         if nk == inputNorm then
-                            pr("Nx.Tra exact node: " .. tostring(nod.LoN) .. " maI=" .. tostring(nod.MaI) .. " wx=" .. tostring(nod.WX) .. " wy=" .. tostring(nod.WY))
+                            dbg("Nx.Tra exact node: " .. tostring(nod.LoN) .. " maI=" .. tostring(nod.MaI) .. " wx=" .. tostring(nod.WX) .. " wy=" .. tostring(nod.WY))
                             foundNode = true
                         elseif nk and inputNorm and string.find(nk, inputNorm, 1, true) then
-                            pr("Nx.Tra partial node: " .. tostring(nod.LoN))
+                            dbg("Nx.Tra partial node: " .. tostring(nod.LoN))
                         end
                     end
                 end
             end
         end
     else
-        pr("Nx.Tra.Tra unavailable")
+        dbg("Nx.Tra.Tra unavailable")
     end
 
     if not foundNode then
-        pr("Nx.Tra exact node: none")
+        dbg("Nx.Tra exact node: none")
     end
 
     if Nx and Nx.Map and Nx.Map.Gui and type(Nx.Map.Gui.FiT2) == "function" then
         local npcName, wx, wy = Nx.Map.Gui:FiT2(name)
-        pr("FiT2 => npcName=" .. tostring(npcName) .. " wx=" .. tostring(wx) .. " wy=" .. tostring(wy))
+        dbg("FiT2 => npcName=" .. tostring(npcName) .. " wx=" .. tostring(wx) .. " wy=" .. tostring(wy))
     else
-        pr("FiT2 unavailable")
+        dbg("FiT2 unavailable")
     end
 
-    pr("---- FM DEBUG END ----")
+    dbg("---- FM DEBUG END ----")
 end
 
 function CW.TrimDestinationSearchText(value)
@@ -10064,7 +9717,7 @@ function CW.PrintDestinationSearchAmbiguity(query, candidates)
     if #candidates > limit then
         parts[#parts + 1] = "+" .. tostring(#candidates - limit) .. " more"
     end
-    pr("destination match ambiguous: " .. tostring(query) .. " -> " .. table.concat(parts, "; "))
+    dbg("destination match ambiguous: " .. tostring(query) .. " -> " .. table.concat(parts, "; "))
 end
 
 function CW.CollectKnownDestinationSearchCandidates(candidates, query)
@@ -10333,9 +9986,9 @@ function CW.RouteToDestinationSearchCandidate(candidate, query)
     end
 
     if routePoints and #routePoints > 1 then
-        pr(format("routing to matched known route: %s (%d stop(s), starting at stop 1)", tostring(candidate.name or query), #routePoints))
+        dbg(format("routing to matched known route: %s (%d stop(s), starting at stop 1)", tostring(candidate.name or query), #routePoints))
     else
-        pr(format("routing to destination match: %s", CW.FormatDestinationSearchCandidate(candidate)))
+        dbg(format("routing to destination match: %s", CW.FormatDestinationSearchCandidate(candidate)))
     end
 
 
@@ -10372,24 +10025,6 @@ function CW.SetDestinationSearchPage(page)
     end
 
     CW.RefreshDestinationSearchFrame()
-end
-
-local function FormatSecondsHms(seconds)
-    local function fmt(n)
-        if n < 10 then return "0" .. tostring(n) end
-        return tostring(n)
-    end
-
-    seconds = tonumber(seconds)
-    if not seconds or seconds < 0 then return "??:??:??" end
-
-    seconds = math.floor(seconds + 0.5)
-
-    local h = math.floor(seconds / 3600)
-    local m = math.floor((seconds % 3600) / 60)
-    local s = seconds % 60
-
-    return fmt(h) .. "h" .. fmt(m) .. "m" .. fmt(s) .. "s"
 end
 
 function CW.RefreshDestinationSearchFrame()
@@ -10534,7 +10169,7 @@ function CW.RefreshDestinationSearchFrame()
         meta:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
         meta:SetWidth(510)
         meta:SetJustifyH("LEFT")
-        meta:SetText(format("%s | %s", FormatSecondsHms(candidate.score or "?"), CW.FormatDestinationSearchCandidate(candidate)))
+        meta:SetText(format("%s", CW.FormatDestinationSearchCandidate(candidate)))
 
         local routeBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
         routeBtn:SetWidth(82)
@@ -10927,7 +10562,7 @@ SlashHandler = function(msg)
             else
                 local handled = CW.TryRouteByDestinationKeyword(rawMsg)
                 if not handled then
-                    pr("unknown command: " .. tostring(msg))
+                    pr("No matches: " .. tostring(msg))
                 end
             end
         end
