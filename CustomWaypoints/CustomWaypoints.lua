@@ -51,6 +51,7 @@ local TARGET_TYPE_GOTO = "Goto"
 local TARGET_TYPE_STRAIGHT = "CW_STRAIGHT"
 
 local STRAIGHT_EDGE_TYPES = {
+    flying = true,
     boat = true,
     zeppelin = true,
     tram = true,
@@ -1288,6 +1289,19 @@ function CW.DirectFlyingCostSeconds(wx1, wy1, wx2, wy2)
     return WorldToYards(d) / yardsPerSecond
 end
 
+function CW.CanFlyBetweenMapIds(fromMaI, toMaI)
+    local fromRegion = CW.GetFlyableExpansionRegion(fromMaI)
+    local toRegion = CW.GetFlyableExpansionRegion(toMaI)
+    return fromRegion ~= nil and fromRegion == toRegion and CW.PlayerCanFlyInRegion(fromMaI) == true
+end
+
+local function MovementCostTypeLabel(fromMaI, wx1, wy1, toMaI, wx2, wy2, walkLabel, flyLabel)
+    if CW.CanFlyBetweenMapIds(fromMaI, toMaI) then
+        return CW.DirectFlyingCostSeconds(wx1, wy1, wx2, wy2), "flying", flyLabel or "fly"
+    end
+    return WalkCostSeconds(wx1, wy1, wx2, wy2), "walk", walkLabel or "walk"
+end
+
 local function IsRealTransportType(edgeType)
     return edgeType and STRAIGHT_EDGE_TYPES[edgeType] or false
 end
@@ -2010,12 +2024,12 @@ local function EnsureGraph()
         for j = 1, graph.nodeCount do
             if i ~= j then
                 local nj = graph.nodes[j]
-                if ni.maI == nj.maI then
-                    local baseCost = WalkCostSeconds(ni.wx, ni.wy, nj.wx, nj.wy)
-                    if baseCost <= walkRadius then
-                        sameMap[#sameMap + 1] = { id = j, cost = math.max(1, baseCost), forced = false }
+                if ni.maI == nj.maI or CW.CanFlyBetweenMapIds(ni.maI, nj.maI) then
+                    local baseCost, moveType, moveLabel = MovementCostTypeLabel(ni.maI, ni.wx, ni.wy, nj.maI, nj.wx, nj.wy, "walk", "fly")
+                    if baseCost <= walkRadius or moveType == "flying" then
+                        sameMap[#sameMap + 1] = { id = j, cost = math.max(1, baseCost), forced = false, moveType = moveType, moveLabel = moveLabel }
                     elseif IsTravelNodeType(ni.type) and IsTravelNodeType(nj.type) then
-                        sameMap[#sameMap + 1] = { id = j, cost = baseCost + forcedWalkPenalty, forced = true }
+                        sameMap[#sameMap + 1] = { id = j, cost = baseCost + forcedWalkPenalty, forced = true, moveType = moveType, moveLabel = moveLabel == "fly" and "fly-penalized" or "walk-penalized" }
                     end
                 end
             end
@@ -2028,11 +2042,11 @@ local function EnsureGraph()
         for _, cand in ipairs(sameMap) do
             if not cand.forced then
                 if added < walkNeighbors then
-                    addEdge(i, cand.id, cand.cost, "walk", "walk", false)
+                    addEdge(i, cand.id, cand.cost, cand.moveType or "walk", cand.moveLabel or "walk", false)
                     added = added + 1
                 end
             elseif added == 0 and forcedAdded < 1 then
-                addEdge(i, cand.id, cand.cost, "walk", "walk-penalized", false)
+                addEdge(i, cand.id, cand.cost, cand.moveType or "walk", cand.moveLabel or "walk-penalized", false)
                 forcedAdded = forcedAdded + 1
             end
         end
@@ -2369,15 +2383,17 @@ local function BuildTransportLeg(startPoint, destPoint)
         for id, n in pairs(nodes) do
             if type(id) == "number"
                 and id ~= queryId
-                and n.maI == preferMapId
+                and (n.maI == preferMapId or CW.CanFlyBetweenMapIds(preferMapId, n.maI))
                 and n.type ~= "start"
                 and n.type ~= "goal" then
 
-                local raw = WalkCostSeconds(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy)
+                local raw, moveType, moveLabel = MovementCostTypeLabel(preferMapId, nodes[queryId].wx, nodes[queryId].wy, n.maI, n.wx, n.wy, outwardLabel, isStart and "fly-to-node" or "fly-to-goal")
                 local yards = WorldToYards(Dist(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy))
                 local pe, te = countPortalTaxi(n)
 
                 local candidate = {
+                    moveType = moveType,
+                    moveLabel = moveLabel,
                     id = id,
                     rawCost = raw,
                     yards = yards,
@@ -2450,7 +2466,7 @@ local function BuildTransportLeg(startPoint, destPoint)
             if attached >= limit then break end
 
             if c.rawCost <= 2200 and not used[c.id] then
-                connectBidirectional(queryId, c.id, c.rawCost, "walk", outwardLabel)
+                connectBidirectional(queryId, c.id, c.rawCost, c.moveType or "walk", c.moveLabel or outwardLabel)
                 used[c.id] = true
                 attached = attached + 1
             end
@@ -2463,7 +2479,7 @@ local function BuildTransportLeg(startPoint, destPoint)
             for i = 1, math.min(12, #sameMap) do
                 local c = sameMap[i]
                 if c and not used[c.id] then
-                    connectBidirectional(queryId, c.id, c.rawCost, "walk", outwardLabel)
+                    connectBidirectional(queryId, c.id, c.rawCost, c.moveType or "walk", c.moveLabel or outwardLabel)
                     used[c.id] = true
                     attached = attached + 1
                 end
@@ -2629,7 +2645,7 @@ local function BuildRouteLeg(startPoint, destPoint)
                 zx = destPoint.zx,
                 zy = destPoint.zy,
                 mapName = destPoint.mapName,
-                edgeType = "walk",
+                edgeType = useDirectFlying and "flying" or "walk",
                 label = useDirectFlying and "Direct flight" or (startPoint.maI ~= destPoint.maI and "Direct destination" or "Walk"),
                 cost = directCost,
                 forceStraight = useDirectFlying or startPoint.maI ~= destPoint.maI,
@@ -2919,6 +2935,8 @@ local function BuildSyncLabel(idx, pt)
         detail = "Walk to transport"
     elseif edgeType == "transport-to-goal" then
         detail = "Walk to destination"
+    elseif edgeType == "flying" then
+        detail = "Fly"
     elseif edgeType == "walk" then
         detail = "Walk"
     elseif edgeType == "connector" or edgeType == "walklink" then
