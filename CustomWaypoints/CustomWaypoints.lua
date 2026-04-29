@@ -76,6 +76,9 @@ local TRANSIT_EDGE_TYPES = {
 BINDING_HEADER_CUSTOMWAYPOINTS = "CustomWaypoints"
 BINDING_NAME_CW_TOGGLE_KNOWN_LOCATIONS = "Toggle Known Locations"
 BINDING_NAME_CW_SAVE_HERE = "Save Here"
+BINDING_NAME_CW_CLEAR_QUEUE = "Clear Queue"
+BINDING_NAME_CW_UNDO = "Undo"
+BINDING_NAME_CW_REDO = "Redo"
 BINDING_NAME_CW_DELETE_SELECTED_KNOWN_LOCATION = "Delete Selected Known Location"
 
 local DEFAULTS = {
@@ -91,7 +94,7 @@ local DEFAULTS = {
     walkYardsPerSecond = 7,
     useIntercontinentalRouting = true,
     useFlightMasters = true,
-    simplifyTransitWaypoints = false,
+    simplifyTransitWaypoints = true,
     showUi = true,
     uiScale = 1,
     transportDiscoveryEnabled = false,
@@ -142,7 +145,7 @@ local function RefreshUiHeader()
     end
     local db = STATE.db or {}
     if STATE.ui and STATE.ui.header then
-        STATE.ui.header:SetText("CW options")
+        STATE.ui.header:SetText("Options")
         if STATE.ui.legend then
             STATE.ui.legend:Hide()
         end
@@ -7188,6 +7191,24 @@ function CW_DELETE_SELECTED_KNOWN_LOCATION()
     CustomWaypoints_DeleteSelectedKnownLocation()
 end
 
+function CW_CLEAR_QUEUE()
+    if SlashHandler then
+        SlashHandler("clear")
+    end
+end
+
+function CW_UNDO()
+    if SlashHandler then
+        SlashHandler("undo")
+    end
+end
+
+function CW_REDO()
+    if SlashHandler then
+        SlashHandler("redo")
+    end
+end
+
 function CustomWaypoints_DeleteSelectedKnownLocation()
     local ui = STATE.knownLocationsUi
     if not ui or not ui.frame or not ui.frame:IsShown() then
@@ -7506,7 +7527,7 @@ local function EnsureUi()
     }
 
     RefreshUiHeader()
-    AppendUiLogLine("CW UI ready. Undo steps back add/clear/pop (snapshot stack). Redo: /cw redo or Ctrl+Shift+Y if unbound.")
+    AppendUiLogLine("CW UI ready. Undo steps back add/clear/pop (snapshot stack). Redo: /cw redo or Ctrl+Shift+R if unbound.")
     f:Hide()
     return STATE.ui
 end
@@ -7637,13 +7658,6 @@ local function EnsureInterfaceOptionsPanel()
     return panel
 end
 
-local function InstallSaveHereHotkey()
-    -- Intentionally no legacy click-binding path here.
-    -- Save Here must use the same native binding path as Shift+G:
-    -- Bindings.xml + EnsureSaveHereBinding() + TryAutoBindCommand().
-    STATE.saveHereHotkeyInstalled = true
-end
-
 local function InstallUndoRedoBindings()
     if STATE.bindingsInstalled then return end
 
@@ -7694,46 +7708,20 @@ local function InstallUndoRedoBindings()
         RefreshUiHeader()
     end)
 
-    local undoClick = "CLICK CWUndoHotkeyButton:LeftButton"
-    local redoClick = "CLICK CWRedoHotkeyButton:LeftButton"
-    local clearClick = "CLICK CWClearHotkeyButton:LeftButton"
     local bindChanged = false
 
-    local function CanAssignKey(key, boundTo)
-        if not GetBindingAction then return true end
-        local a = GetBindingAction(key)
-        return (not a or a == "" or a == boundTo)
-    end
-
-    if CanAssignKey("CTRL-SHIFT-Z", undoClick) then
-        if SetBindingClick then
-            SetBindingClick("CTRL-SHIFT-Z", "CWUndoHotkeyButton", "LeftButton")
-            bindChanged = true
-        elseif SetBinding then
-            SetBinding("CTRL-SHIFT-Z", undoClick)
+    local function EnsureNativeBinding(key, command)
+        if not (GetBindingAction and SetBinding) then return end
+        local current = GetBindingAction(key)
+        if not current or current == "" then
+            SetBinding(key, command)
             bindChanged = true
         end
     end
 
-    if CanAssignKey("CTRL-SHIFT-Y", redoClick) then
-        if SetBindingClick then
-            SetBindingClick("CTRL-SHIFT-Y", "CWRedoHotkeyButton", "LeftButton")
-            bindChanged = true
-        elseif SetBinding then
-            SetBinding("CTRL-SHIFT-Y", redoClick)
-            bindChanged = true
-        end
-    end
-
-    if CanAssignKey("CTRL-SHIFT-C", clearClick) then
-        if SetBindingClick then
-            SetBindingClick("CTRL-SHIFT-C", "CWClearHotkeyButton", "LeftButton")
-            bindChanged = true
-        elseif SetBinding then
-            SetBinding("CTRL-SHIFT-C", clearClick)
-            bindChanged = true
-        end
-    end
+    EnsureNativeBinding("CTRL-SHIFT-Z", "CW_UNDO")
+    EnsureNativeBinding("CTRL-SHIFT-Y", "CW_REDO")
+    EnsureNativeBinding("CTRL-SHIFT-C", "CW_CLEAR_QUEUE")
 
     if bindChanged and SaveBindings and GetCurrentBindingSet then
         pcall(SaveBindings, GetCurrentBindingSet())
@@ -7741,6 +7729,10 @@ local function InstallUndoRedoBindings()
 
     STATE.bindingsInstalled = true
 end
+
+CustomWaypoints_ClearQueue = CW_CLEAR_QUEUE
+CustomWaypoints_Undo = CW_UNDO
+CustomWaypoints_Redo = CW_REDO
 
 local function ToggleUi()
     EnsureUi()

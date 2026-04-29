@@ -10,18 +10,19 @@
         end
     </Binding>
     <Binding name="CW_CLEAR_QUEUE" header="CUSTOMWAYPOINTS">
-        if CustomWaypoints_ClearQueue then
-            CustomWaypoints_ClearQueue()
+        if CW_CLEAR_QUEUE then
+            CW_CLEAR_QUEUE()
         end
     </Binding>
     <Binding name="CW_UNDO" header="CUSTOMWAYPOINTS">
-        if CustomWaypoints_Undo then
-            CustomWaypoints_Undo()
+        if CW_UNDO then
+            CW_UNDO()
         end
     </Binding>
+
     <Binding name="CW_REDO" header="CUSTOMWAYPOINTS">
-        if CustomWaypoints_Redo then
-            CustomWaypoints_Redo()
+        if CW_REDO then
+            CW_REDO()
         end
     </Binding>
     <Binding name="CW_DELETE_SELECTED_KNOWN_LOCATION" header="CUSTOMWAYPOINTS">
